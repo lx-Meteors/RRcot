@@ -1,1 +1,5 @@
 ./model/*
+.vscode/*
+.output/*
+.data/*
+*.jsonl

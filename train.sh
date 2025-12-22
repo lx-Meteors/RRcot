@@ -18,7 +18,7 @@ gradient_accumulation_steps=4
 warmup_ratio=0.05
 #控制训练模式
 # mode="aug-wo-pc" 
-mode="normal"
+mode="aug-wo-pc"
 warmup_steps=0
 
 # others
