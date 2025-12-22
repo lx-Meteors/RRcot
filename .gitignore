@@ -19,6 +19,12 @@ build/
 
 # Logs
 *.log
+ours_infer_log/
+inference_results/
+sglang_inference_results/
+
+# debugs
+*debug*
 
 # Data
 data/train/dataset_cache/
