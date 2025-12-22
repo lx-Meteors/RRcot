@@ -52,7 +52,7 @@ done
 split_size=4
 
 index=1
-CUDA_VISIBLE_DEVICES=1 nohup python "${root_dir}/inference.py" \
+CUDA_VISIBLE_DEVICES=0 nohup python "${root_dir}/inference.py" \
     --model_tag $model_tag \
     --model_short_tag $model_short_tag \
     --ckpt $ckpt \
@@ -78,7 +78,7 @@ CUDA_VISIBLE_DEVICES=1 nohup python "${root_dir}/inference.py" \
 
 
 index=2
-CUDA_VISIBLE_DEVICES=2 nohup python "${root_dir}/inference.py" \
+CUDA_VISIBLE_DEVICES=1 nohup python "${root_dir}/inference.py" \
     --model_tag $model_tag \
     --model_short_tag $model_short_tag \
     --ckpt $ckpt \
@@ -103,7 +103,7 @@ CUDA_VISIBLE_DEVICES=2 nohup python "${root_dir}/inference.py" \
 
 
 index=3
-CUDA_VISIBLE_DEVICES=3 nohup python "${root_dir}/inference.py" \
+CUDA_VISIBLE_DEVICES=2 nohup python "${root_dir}/inference.py" \
     --model_tag $model_tag \
     --model_short_tag $model_short_tag \
     --ckpt $ckpt \
@@ -128,7 +128,7 @@ CUDA_VISIBLE_DEVICES=3 nohup python "${root_dir}/inference.py" \
 
 
 index=4
-CUDA_VISIBLE_DEVICES=4 nohup python "${root_dir}/inference.py" \
+CUDA_VISIBLE_DEVICES=3 nohup python "${root_dir}/inference.py" \
     --model_tag $model_tag \
     --model_short_tag $model_short_tag \
     --ckpt $ckpt \
