@@ -30,3 +30,5 @@ sglang_inference_results/
 data/train/dataset_cache/
 output/
 EOF
+data/train/train.jsonl
+data/train/data.zip
