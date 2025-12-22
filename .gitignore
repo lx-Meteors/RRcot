@@ -20,6 +20,7 @@ build/
 # Logs
 *.log
 ours_infer_log/
+ours_train_log/
 inference_results/
 sglang_inference_results/
 
@@ -33,3 +34,6 @@ EOF
 data/train/train.jsonl
 data/train/train_debug.jsonl
 data/train/data.zip
+
+# Hope
+lxy_hope/

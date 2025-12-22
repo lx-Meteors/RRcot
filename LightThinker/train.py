@@ -203,7 +203,8 @@ def get_dataset_and_data_collator(
         cache_dir=cache_dir,
         cache_filename=cache_filename,
         force_preprocess=False,
-        local_rank=local_rank
+        local_rank=local_rank,
+        use_EPL=args.use_EPL,
     )
 
     data_collator = MyDataCollator(
