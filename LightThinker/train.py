@@ -98,6 +98,8 @@ def get_parser():
     parser.add_argument('--warmup_ratio', type=float, default=0.)
     parser.add_argument('--warmup_steps', type=int, default=0)
     parser.add_argument('--lr_scheduler_type', type=str, default='linear')
+
+    parser.add_argument('--use_EPL', type=str2bool, default=False)
     args = parser.parse_args()
     return args
 
