@@ -100,6 +100,6 @@ deepspeed --include localhost:0,1,2,3 LightThinker/train.py \
     --hybrid $hybrid \
     --prefill_compress $prefill_compress \
     --lr_scheduler_type $lr_scheduler_type \
-    --use_EPL
+    --use_EPL True
 
 # nohup bash lxy_train_lighthinker_epl.sh > our_train_log/lxy_train_lighthinker_epl.log 2>&1 &

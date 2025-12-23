@@ -79,46 +79,106 @@ class MyDataset(torch.utils.data.Dataset):
             if self.local_rank == 0:
                 should_process = not os.path.exists(self.cache_path) or force_preprocess
                 
+                # if should_process:
+                #     print(f"[Rank {self.local_rank}] Cache not found or forced. Processing data...")
+                #     self.init()
+                #     self.init_for_aug_data_wo_pc()
+                    
+                #     print(f"[Rank {self.local_rank}] Saving cache to {self.cache_path}...")
+                #     # 保存数据
+                #     cache_data = {
+                #         'normal': self.normal_data,
+                #         'aug': self.aug_data,
+                #         'recover': self.recover_data,
+                #         'recover_prompt': self.recover_prompt_data,
+                #         'aug_wo_pc': self.aug_data_wo_prompt_comp
+                #     }
+                #     torch.save(cache_data, self.cache_path)
+                #     print(f"[Rank {self.local_rank}] Cache saved!")
+                #     data_in_memory = True # Rank 0 刚刚处理完，内存里已经有了
+                # else:
+                #     print(f"[Rank {self.local_rank}] Cache found at {self.cache_path}. Will load shared file.")
+                
                 if should_process:
                     print(f"[Rank {self.local_rank}] Cache not found or forced. Processing data...")
-                    self.init()
-                    self.init_for_aug_data_wo_pc()
-                    
-                    print(f"[Rank {self.local_rank}] Saving cache to {self.cache_path}...")
-                    # 保存数据
-                    cache_data = {
-                        'normal': self.normal_data,
-                        'aug': self.aug_data,
-                        'recover': self.recover_data,
-                        'recover_prompt': self.recover_prompt_data,
-                        'aug_wo_pc': self.aug_data_wo_prompt_comp
-                    }
-                    torch.save(cache_data, self.cache_path)
-                    print(f"[Rank {self.local_rank}] Cache saved!")
-                    data_in_memory = True # Rank 0 刚刚处理完，内存里已经有了
+                    try:
+                        self.init()
+                        self.init_for_aug_data_wo_pc()
+                        
+                        print(f"[Rank {self.local_rank}] Saving cache to {self.cache_path}...")
+                        # 保存数据到临时文件，然后原子性重命名
+                        cache_data = {
+                            'normal': self.normal_data,
+                            'aug': self.aug_data,
+                            'recover': self.recover_data,
+                            'recover_prompt': self.recover_prompt_data,
+                            'aug_wo_pc': self.aug_data_wo_prompt_comp
+                        }
+                        
+                        # 使用临时文件 + 重命名，避免其他进程读到不完整的文件
+                        temp_cache_path = self.cache_path + '.tmp'
+                        torch.save(cache_data, temp_cache_path)
+                        os.rename(temp_cache_path, self.cache_path)
+                        
+                        print(f"[Rank {self.local_rank}] Cache saved!")
+                        data_in_memory = True
+                    except Exception as e:
+                        print(f"[Rank {self.local_rank}] ERROR during processing: {e}")
+                        raise
                 else:
-                    print(f"[Rank {self.local_rank}] Cache found at {self.cache_path}. Will load shared file.")
+                    print(f"[Rank {self.local_rank}] Cache found at {self.cache_path}.")
             
             # 4. 关键：同步屏障 (Barrier)
             # 所有的进程（Rank 0, 1, 2...）都会运行到这里。
             # 如果 Rank 0 还在上面处理数据，其他进程会在这里死等，直到 Rank 0 跑完并执行到这里。
+            # if dist.is_initialized():
+            #     dist.barrier()
+
+            print(f"[Rank {self.local_rank}] Waiting at barrier...")
             if dist.is_initialized():
                 dist.barrier()
-            
+                print(f"[Rank {self.local_rank}] Passed barrier!")
+            else:
+                print(f"[Rank {self.local_rank}] WARNING: dist not initialized!")
+                    
             # 5. 加载数据
             # 如果我是 Rank 0 且刚才已经处理过(data_in_memory=True)，就不用读了，省一次 IO。
             # 否则（我是 Rank > 0，或者我是 Rank 0 但发现文件早就存在没经过处理），都需要读取文件。
             if not data_in_memory:
                 print(f"[Rank {self.local_rank}] Loading cached data from {self.cache_path}...")
                 # map_location='cpu' 很重要，防止多进程同时加载导致 GPU 显存瞬间爆炸
-                cached_data = torch.load(self.cache_path, map_location='cpu', weights_only=False) # 如果你还没降级torch，记得 weights_only
+                # cached_data = torch.load(self.cache_path, map_location='cpu', weights_only=False) # 如果你还没降级torch，记得 weights_only
                 
-                self.normal_data = cached_data['normal']
-                self.aug_data = cached_data['aug']
-                self.recover_data = cached_data['recover']
-                self.recover_prompt_data = cached_data['recover_prompt']
-                self.aug_data_wo_prompt_comp = cached_data['aug_wo_pc']
-                print(f"[Rank {self.local_rank}] Loaded successfully.")
+                # self.normal_data = cached_data['normal']
+                # self.aug_data = cached_data['aug']
+                # self.recover_data = cached_data['recover']
+                # self.recover_prompt_data = cached_data['recover_prompt']
+                # self.aug_data_wo_prompt_comp = cached_data['aug_wo_pc']
+                # print(f"[Rank {self.local_rank}] Loaded successfully.")
+
+                # 验证文件是否存在
+                if not os.path.exists(self.cache_path):
+                    raise FileNotFoundError(
+                        f"[Rank {self.local_rank}] Cache file not found: {self.cache_path}\n"
+                        f"This usually means Rank 0 failed to save the cache."
+                    )
+                
+                try:
+                    cached_data = torch.load(
+                        self.cache_path, 
+                        map_location='cpu', 
+                        weights_only=False
+                    )
+                    
+                    self.normal_data = cached_data['normal']
+                    self.aug_data = cached_data['aug']
+                    self.recover_data = cached_data['recover']
+                    self.recover_prompt_data = cached_data['recover_prompt']
+                    self.aug_data_wo_prompt_comp = cached_data['aug_wo_pc']
+                    print(f"[Rank {self.local_rank}] Loaded successfully.")
+                except Exception as e:
+                    print(f"[Rank {self.local_rank}] ERROR loading cache: {e}")
+                    raise
         
         else:
             # 如果没配置缓存路径，就像以前一样各自跑（不推荐）
