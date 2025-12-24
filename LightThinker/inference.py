@@ -680,7 +680,7 @@ class TokenUtils:
         self.show_output_input_ids.clear()
 
     def use_epl_for_compression(self, position_ids, indicator):
-        print("Use EPL for compression!")
+        # print("Use EPL for compression!")
         device = position_ids.device
         text_start, text_end, compression_ratio, compression_count = indicator
         compression_ratio = max(compression_ratio - (1 if compression_ratio % 2 == 0 else 0), 1)
@@ -1709,9 +1709,9 @@ def main():
 
     task_list = [
         (MMLUReader(), "mmlu"),
-        # (GSM8KReader(), "gsm8k"),
-        # (GPQAReader(), "gpqa"),
-        # (BBHReader(), "bbh"),
+        (GSM8KReader(), "gsm8k"),
+        (GPQAReader(), "gpqa"),
+        (BBHReader(), "bbh"),
     ]
 
     for reader, name in task_list:
