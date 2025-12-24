@@ -640,6 +640,7 @@ class TokenUtils:
         self._current_input_ids.extend(input_ids)
         self.max_token = max(self.max_token, self._seen_tokens)
         if return_tensors:
+            # 这里切片的原因是前面用的都是kvcache，所以不需要重新考虑position_ids，只需解决当前position_ids
             return self.input_ids[..., _start:_end], self.position_ids[..., _start:_end]
  
     def reduce_input_ids(self, start:int, end:int):
@@ -677,6 +678,17 @@ class TokenUtils:
         self._current_position_ids.clear()
         self.show_prompt_input_ids.clear()
         self.show_output_input_ids.clear()
+
+    def use_epl_for_compression(self, position_ids, indicator):
+        # print("Use EPL for compression!")
+        device = position_ids.device
+        text_start, text_end, compression_ratio, compression_count = indicator
+        compression_ratio = max(compression_ratio - (1 if compression_ratio % 2 == 0 else 0), 1)
+        compressed_positions = torch.arange((text_start + (compression_ratio - 1) // 2), text_end, step=compression_ratio, device=device)[:compression_count].unsqueeze(0)
+        prefix_position_ids = position_ids[:, :1]
+        suffix_position_ids = position_ids[:, compressed_positions.size(1)+1:] 
+        position_ids_for_epl = torch.cat([prefix_position_ids, compressed_positions, suffix_position_ids], dim=1)
+        return position_ids_for_epl
 
 # ========== CORE CODE ==========
 @torch.no_grad()
@@ -1199,7 +1211,8 @@ def _sentence_level_generate(
     kv_utils:KVUtils,
     token_utils:TokenUtils,
     predicted_token_id:int,
-    update_attention_method:str="global"
+    update_attention_method:str="global",
+    use_EPL:bool=False,
 ) -> Tuple[str,str]:
     assert update_attention_method in ["global", "local"]
 
@@ -1208,17 +1221,17 @@ def _sentence_level_generate(
     # eos_token_id = None
     output_comp_step = comp_config.output_comp_step
 
-    global_start:int = len(token_utils._whole_input_ids)
-    local_start:int = len(token_utils._current_input_ids)
+    global_start:int = len(token_utils._whole_input_ids) # 整个输入完整的序列，包括cot+压缩token？
+    local_start:int = len(token_utils._current_input_ids) # 应该是当前输入的序列，意味着去掉了cot，但是有压缩token
 
-
+    compression_count = 0
     assert local_start == kv_utils.get_cache()._seen_tokens, \
         f"{local_start} == {kv_utils.get_cache()._seen_tokens}"
     while predicted_token_id != eos_token_id and new_token_counters < max_new_tokens:
         new_input_ids = [predicted_token_id]
         IS_COMP_MODE:bool = False
         token_utils.show_output_input_ids.append(predicted_token_id)
-
+        # print(tokenizer.decode(token_utils.show_output_input_ids))
         # 1. construct attention_mask
         if predicted_token_id == comp_config.split_token_id:
             IS_COMP_MODE = True
@@ -1229,6 +1242,7 @@ def _sentence_level_generate(
                 comp_config.continue_token_id
             )
             new_length = len(new_input_ids)
+            compression_count = (len(comp_config.get_output_comp_token_id()) + 1)
             if update_attention_method == 'global':
                 origin_length = len(token_utils._whole_input_ids)
                 indicator = [
@@ -1280,9 +1294,18 @@ def _sentence_level_generate(
         if token_utils.max_length < len(new_input_ids) + token_utils._seen_tokens:
             # exceed length
             break
-        input_ids, position_ids = token_utils.set_input_ids(
-            new_input_ids, return_tensors=True
-        ) 
+
+        # ......The code is beautifully repeated......
+        input_ids, position_ids = token_utils.set_input_ids(new_input_ids, return_tensors=True)
+        if use_EPL and IS_COMP_MODE:
+            origin_length = len(token_utils._whole_input_ids) - compression_count
+            indicator = [
+                    global_start, # 当前开始位置
+                    origin_length + 1, # 当前结束位置，下一个位置应该是压缩token
+                    (origin_length + 1 - global_start) // len(comp_config.get_output_comp_token_id()), # 当前压缩率
+                    len(comp_config.get_output_comp_token_id()) # 压缩token数量
+                ]
+            position_ids = token_utils.use_epl_for_compression(position_ids, indicator)
         if DEBUG:
             if update_attention_method == 'global':
                 DebugUtils.show_global_attention(
@@ -1310,7 +1333,8 @@ def _sentence_level_generate(
                     file_name="debug_local_1.png",
                 )
 
-        # 3. generate new token
+        # 3. generate new token(本来对这里有疑问的，为什么attention_mask是全0？因为当前只传入了一个token，前面的是kvcache，所以前面正常应该都能看到？
+        # 突然看到非压缩时indicator都是None，貌似合理了)
         model_output = model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -1319,7 +1343,6 @@ def _sentence_level_generate(
             return_dict=True,
             position_ids=position_ids,
         )
-
         # 4. update kv cache
         if IS_COMP_MODE:
             start = local_start
@@ -1331,10 +1354,13 @@ def _sentence_level_generate(
             global_start:int = len(token_utils._whole_input_ids)
             local_start:int = len(token_utils._current_input_ids)
 
-        # 5. get new predicted_tokens
+        # 5. get new predicted_tokens 151665
         predicted_token_id:int = InferenceUtils.get_predicted_token_ids(
             model_output=model_output, idx=-1
         )
+        # debug_count += 1
+        # if debug_count%70==0:
+        #     predicted_token_id = torch.tensor(151665)
         new_token_counters += 1
 
     token_utils.show_output_input_ids.append(predicted_token_id)
@@ -1358,6 +1384,7 @@ def generate(
     attn_utils: AttentionUtils,
     token_utils: TokenUtils,
     update_attention_method:str,
+    use_EPL:bool=False,
 ) -> Tuple[str,str]:
 
     assert update_attention_method in ['global', 'local'], update_attention_method
@@ -1409,7 +1436,8 @@ def generate(
             kv_utils=kv_utils,
             token_utils=token_utils,
             predicted_token_id=predicted_token_id,
-            update_attention_method=update_attention_method
+            update_attention_method=update_attention_method,
+            use_EPL=use_EPL
         )
     
     del kv_utils
@@ -1446,6 +1474,7 @@ def get_parser():
     parser.add_argument('--split_size', type=int)
     # start from 1
     parser.add_argument('--index', type=int)        
+    parser.add_argument('--use_EPL', type=str2bool, default=False)
 
     args = parser.parse_args()
     return args
@@ -1514,6 +1543,7 @@ def eval_dataset(
     dataset_name:str,
     split_size:int=None,
     index:int=None,
+    use_EPL:bool=False,
 ):
 
     if split_size != None and index != None:
@@ -1618,6 +1648,7 @@ def eval_dataset(
                 attn_utils=attn_utils,
                 token_utils=token_utils,
                 update_attention_method=update_attention_method,
+                use_EPL=use_EPL,
             )
             end_time = time.time()
             input_len:int = len(token_utils.show_prompt_input_ids)
@@ -1708,6 +1739,7 @@ def main():
             dataset_name=name,
             split_size=args.split_size,
             index=args.index,
+            use_EPL=args.use_EPL,
         )
 
 if __name__ == '__main__':

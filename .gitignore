@@ -38,4 +38,9 @@ data/train/data.zip
 
 # Hope
 lxy_hope/
+
+
+# liuxin
+meteor_inference.sh
+meteor_train_lightthinker.sh
 lxy_utils/
