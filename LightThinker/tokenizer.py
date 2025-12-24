@@ -225,7 +225,6 @@ class Tokenizer:
                             n_compressed = n_comp
                             # 压缩率为偶数时强制+1改成奇数
                             compression_ratio = max(n_abandoned // n_compressed - (1 if (n_abandoned // n_compressed) % 2 == 0 else 0), 1)
-                            print(compression_ratio)
                             # 均匀映射到 abandoned 段: 从len(position_ids) 到 len(position_ids) + n_abandoned -1 之间
                             # 这里减去压缩Token的使用总数量，第一次压缩时不需要考虑
                             start_pos = len(final_item['input_ids']) + (compression_ratio - 1) // 2 - compression_count
