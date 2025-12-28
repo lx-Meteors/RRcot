@@ -224,8 +224,8 @@ class Tokenizer:
                             n_abandoned = len(tokenized_input_id_list[i][j])
                             n_compressed = n_comp
                             # 压缩率为偶数时强制+1改成奇数
-                            compression_ratio = round(n_abandoned / n_compressed)
-                            compression_ratio = max(compression_ratio - (1 if compression_ratio % 2 == 0 else 0), 1)
+                            compression_ratio = n_abandoned // n_compressed
+                            compression_ratio = max(compression_ratio, 1)
                             # 均匀映射到 abandoned 段: 从len(position_ids) 到 len(position_ids) + n_abandoned -1 之间
                             # 这里减去压缩Token的使用总数量(因为压缩的是cot)，第一次压缩时不需要考虑
                             start_pos = len(final_item['input_ids']) + (compression_ratio - 1) // 2 - compression_count
@@ -234,9 +234,22 @@ class Tokenizer:
                             if start_pos >= end_pos:
                                 start_pos = len(final_item['input_ids'])
                             compressed_positions = list(range(start_pos, end_pos, compression_ratio))[:n_compressed]
+
+                            while len(compressed_positions)<n_compressed:
+                                compressed_positions.append(compressed_positions[-1])
+                            
+                            # 不足 n_compressed，则从最后一个位置开始 +1 补齐
+                            # if len(compressed_positions) < n_compressed:
+                            #     last = compressed_positions[-1]
+                            #     needed = n_compressed - len(compressed_positions)
+                            #     compressed_positions.extend(
+                            #         [last + i + 1 for i in range(needed)]
+                            #     )
+                            # compressed_positions = compressed_positions[:n_compressed]
                         else:
                             compressed_positions = None
-                if use_EPL and structured_input_indicator[i][j] == 'compressed-output' and compression_ratio!= 1:
+                # 压缩率为1时视为正常token处理
+                if use_EPL and structured_input_indicator[i][j] == 'compressed-output':
                     compression_count += n_compressed
                     for k in range(len(tokenized_label_list[i][j])):
                         if len(final_item['input_ids']) >= max_length:
@@ -263,7 +276,8 @@ class Tokenizer:
                         final_item['labels'].append(
                             tokenized_label_list[i][j][k]
                         )
-      
+                # print("position_ids:", final_item['position_ids'])
+                # print("last token position_id:", final_item['position_ids'][-1])
         # 4. recover
         # we do not use revover mode
         recover_item_list:List[Dict] = list()
