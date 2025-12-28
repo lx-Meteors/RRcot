@@ -682,30 +682,22 @@ class TokenUtils:
     def use_epl_for_compression(self, position_ids, indicator):
         # print("Use EPL for compression!")
         device = position_ids.device
-        text_start, text_end, compression_ratio, compression_count = indicator
-        start = text_start + (compression_ratio - 1) // 2
-        end = text_end
-        if start >= end:  # 因为有时候会存在513 > 512的情况 -> 实际长度512 所以start应该从511开始
-            start = text_start
-        compressed_positions = torch.arange(start, end, step=compression_ratio, device=device)[:compression_count].unsqueeze(0)
+        cot_start, cot_end, step, compression_count = indicator
+        compressed_positions = []
+        for k in range(compression_count):
+            # k * step: 当前分段的起始
+            # step / 2: 当前分段的中心偏移量
+            # base_pos: 全局起始偏移
+            # int(...): 向下取整得到整数索引
+            center_offset = int(k * step + step / 2)
+            
+            # 计算最终位置
+            pos = cot_start + center_offset
+            compressed_positions.append(pos)
 
-        if compressed_positions.size(1) < compression_count:
-            pad_len = compression_count - compressed_positions.size(1)
-            last_pos = compressed_positions[0, -1].repeat(1, pad_len)
-            compressed_positions = torch.cat([compressed_positions, last_pos], dim=1)
-        # # 不足 n_compressed，则从最后一个位置开始 +1 补齐
-        # if len(compressed_positions) < compression_count:
-        #     last = compressed_positions[0][-1]
-        #     needed = compression_count - len(compressed_positions)
-
-        #     extra = (last + torch.arange(1, needed + 1, device=device)).unsqueeze(0)
-
-        #     compressed_positions = torch.cat([compressed_positions, extra],dim=1)
-        # compressed_positions = compressed_positions[:, :compression_count]
-        prefix_position_ids = position_ids[:, :1]
-        # suffix_position_ids = position_ids[:, compressed_positions.size(1)+1:] 
-        suffix_position_ids = torch.tensor([[text_end]], device=device)
-        position_ids_for_epl = torch.cat([prefix_position_ids, compressed_positions, suffix_position_ids], dim=1)
+        # 额外拼接 <|splitter|> <|continue|> position id
+        final_list = [cot_end] + compressed_positions + [cot_end + 1]
+        position_ids_for_epl = torch.tensor(final_list, device=device, dtype=torch.long)
         return position_ids_for_epl
 
 # ========== CORE CODE ==========
@@ -1321,21 +1313,26 @@ def _sentence_level_generate(
             position_ids = position_ids - use_compression_all_count
 
         if use_EPL and IS_COMP_MODE:
-            cot_end = position_ids[0][0]+1
-            compression_ratio = (cot_end - cot_start).item() // len(comp_config.get_output_comp_token_id())
-            compression_ratio = max(compression_ratio, 1)
+            # 这里 position_ids 是 '<|splitter|><|o_0|><|o_1|><|o_2|><|o_3|><|o_4|><|o_5|><|o_6|><|o_7|><|o_8|><|continue|>' 对应的正常位置编码
+            # cot_end = position_ids[0][0] 是 <|splitter|> position id
+            # cot_start 是 cot first token position id
+            # cot_end - cot_start 是 cot 长度，也就是 n_abandoned
+            cot_end = int(position_ids[0][0].item())  
+            step = (cot_end - cot_start).item() / len(comp_config.get_output_comp_token_id())
+            # compression_ratio = (cot_end - cot_start).item() // len(comp_config.get_output_comp_token_id())
+            # compression_ratio = max(compression_ratio, 1)
             indicator = [
-                    cot_start, # 当前cot开始位置
-                    cot_end, # 当前结束位置，下一个位置应该是压缩token
-                    compression_ratio, # 当前压缩率
+                    cot_start, # cot first token position id
+                    cot_end, # <|splitter|> position id，下一个位置是压缩token
+                    step, # 压缩步长
                     len(comp_config.get_output_comp_token_id()) # 压缩token数量
                 ]
             # 更新cot位置
-            cot_start = cot_end
+            # 这里算上 <|splitter|> <|continue|>，对应下一段 cot 的 first token position id
+            cot_start = cot_end + 2
             position_ids = token_utils.use_epl_for_compression(position_ids, indicator)
             use_compression_all_count += len(comp_config.get_output_comp_token_id())
-        # print("position_ids:", position_ids)
-
+            
         if DEBUG:
             if update_attention_method == 'global':
                 DebugUtils.show_global_attention(
