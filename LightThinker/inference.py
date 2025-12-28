@@ -1323,7 +1323,7 @@ def _sentence_level_generate(
         if use_EPL and IS_COMP_MODE:
             cot_end = position_ids[0][0]+1
             compression_ratio = (cot_end - cot_start).item() // len(comp_config.get_output_comp_token_id())
-            # compression_ratio = max(compression_ratio - (1 if compression_ratio % 2 == 0 else 0), 1)
+            compression_ratio = max(compression_ratio, 1)
             indicator = [
                     cot_start, # 当前cot开始位置
                     cot_end, # 当前结束位置，下一个位置应该是压缩token
