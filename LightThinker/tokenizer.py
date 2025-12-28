@@ -219,46 +219,38 @@ class Tokenizer:
                             ]
                         )
 
-                        # 如果是 compressed-output, 生成均匀分布 position_ids（根据代码来看感觉compressed-output部分只包含了compressed-token和continue-token）
+                        # 如果是 compressed-output, 生成均匀分布 position_ids，compressed-output部分只包含compressed-token和continue-token
                         if use_EPL and structured_input_indicator[i][j+1] == 'compressed-output':
                             n_abandoned = len(tokenized_input_id_list[i][j])
                             n_compressed = n_comp
-                            # 压缩率为偶数时强制+1改成奇数
-                            compression_ratio = n_abandoned // n_compressed
-                            compression_ratio = max(compression_ratio, 1)
-                            # 均匀映射到 abandoned 段: 从len(position_ids) 到 len(position_ids) + n_abandoned -1 之间
-                            # 这里减去压缩Token的使用总数量(因为压缩的是cot)，第一次压缩时不需要考虑
-                            start_pos = len(final_item['input_ids']) + (compression_ratio - 1) // 2 - compression_count
-                            end_pos = len(final_item['input_ids']) + n_abandoned - compression_count
-                            # 边界条件解决
-                            if start_pos >= end_pos:
-                                start_pos = len(final_item['input_ids'])
-                            compressed_positions = list(range(start_pos, end_pos, compression_ratio))[:n_compressed]
 
-                            while len(compressed_positions)<n_compressed:
-                                compressed_positions.append(compressed_positions[-1])
+                            base_pos = len(final_item['input_ids']) - compression_count
+                            end_pos = len(final_item['input_ids']) + n_abandoned - compression_count
+                            compressed_positions = []
+                            step = n_abandoned / n_compressed
+                            for k in range(n_compressed):
+                                # k * step: 当前分段的起始
+                                # step / 2: 当前分段的中心偏移量
+                                # base_pos: 全局起始偏移
+                                # int(...): 向下取整得到整数索引
+                                center_offset = int(k * step + step / 2)
+                                
+                                # 计算最终位置
+                                pos = base_pos + center_offset
+                                compressed_positions.append(pos)
                             
-                            # 不足 n_compressed，则从最后一个位置开始 +1 补齐
-                            # if len(compressed_positions) < n_compressed:
-                            #     last = compressed_positions[-1]
-                            #     needed = n_compressed - len(compressed_positions)
-                            #     compressed_positions.extend(
-                            #         [last + i + 1 for i in range(needed)]
-                            #     )
-                            # compressed_positions = compressed_positions[:n_compressed]
                         else:
                             compressed_positions = None
-                # 压缩率为1时视为正常token处理
+                
                 if use_EPL and structured_input_indicator[i][j] == 'compressed-output':
                     compression_count += n_compressed
                     for k in range(len(tokenized_label_list[i][j])):
                         if len(final_item['input_ids']) >= max_length:
                             break
                         # position_id 逻辑
-                        if structured_input_indicator[i][j] == 'compressed-output' and compressed_positions is not None and n_compressed!=0:
+                        if structured_input_indicator[i][j] == 'compressed-output' and compressed_positions is not None and n_compressed != 0:
                             # 为了处理continue token
                             n_compressed = n_compressed - 1
-                            # 使用均匀分布位置
                             final_item['position_ids'].append(compressed_positions[k])
                         else:
                             final_item['position_ids'].append(end_pos)
@@ -276,8 +268,7 @@ class Tokenizer:
                         final_item['labels'].append(
                             tokenized_label_list[i][j][k]
                         )
-                # print("position_ids:", final_item['position_ids'])
-                # print("last token position_id:", final_item['position_ids'][-1])
+
         # 4. recover
         # we do not use revover mode
         recover_item_list:List[Dict] = list()

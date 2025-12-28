@@ -1116,7 +1116,7 @@ if __name__ == '__main__':
         output_compress_instruction="",
         cache_dir="",  # 启用缓存
         cache_filename=None,
-        force_preprocess=False,  # 设置为True可强制重新预处理
+        force_preprocess=True,  # 设置为True可强制重新预处理
         use_EPL=False
     )
 
