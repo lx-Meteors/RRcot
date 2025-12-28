@@ -683,14 +683,25 @@ class TokenUtils:
         # print("Use EPL for compression!")
         device = position_ids.device
         text_start, text_end, compression_ratio, compression_count = indicator
-        compression_ratio = max(compression_ratio - (1 if compression_ratio % 2 == 0 else 0), 1)
         start = text_start + (compression_ratio - 1) // 2
         end = text_end
         if start >= end:  # 因为有时候会存在513 > 512的情况 -> 实际长度512 所以start应该从511开始
             start = text_start
         compressed_positions = torch.arange(start, end, step=compression_ratio, device=device)[:compression_count].unsqueeze(0)
-        if compression_ratio == 1:
-            compressed_positions = (torch.arange( text_start, text_start + compression_count, device=device).unsqueeze(0))
+
+        if compressed_positions.size(1) < compression_count:
+            pad_len = compression_count - compressed_positions.size(1)
+            last_pos = compressed_positions[0, -1].repeat(1, pad_len)
+            compressed_positions = torch.cat([compressed_positions, last_pos], dim=1)
+        # # 不足 n_compressed，则从最后一个位置开始 +1 补齐
+        # if len(compressed_positions) < compression_count:
+        #     last = compressed_positions[0][-1]
+        #     needed = compression_count - len(compressed_positions)
+
+        #     extra = (last + torch.arange(1, needed + 1, device=device)).unsqueeze(0)
+
+        #     compressed_positions = torch.cat([compressed_positions, extra],dim=1)
+        # compressed_positions = compressed_positions[:, :compression_count]
         prefix_position_ids = position_ids[:, :1]
         # suffix_position_ids = position_ids[:, compressed_positions.size(1)+1:] 
         suffix_position_ids = torch.tensor([[text_end]], device=device)
@@ -1306,28 +1317,25 @@ def _sentence_level_generate(
 
         # ......The code is beautifully repeated......
         input_ids, position_ids = token_utils.set_input_ids(new_input_ids, return_tensors=True)
-        #     position_ids = position_ids - len(comp_config.get_output_comp_token_id())
         if use_EPL:
             position_ids = position_ids - use_compression_all_count
-        # print("Before EPL:", position_ids)
-        # print(tokenizer.decode(token_utils._whole_input_ids))
+
         if use_EPL and IS_COMP_MODE:
-            # 这里减去current_compression_and_continue_count的目的是为了得到当前cot的位置，所以需要减去current_compression_and_continue_count(10)
-            # ten_or_nine = current_compression_and_continue_count // 10
-            # origin_length = len(token_utils._whole_input_ids) - current_compression_and_continue_count + (0 if ten_or_nine//10==1 else ten_or_nine)-1
             cot_end = position_ids[0][0]+1
+            compression_ratio = (cot_end - cot_start).item() // len(comp_config.get_output_comp_token_id())
+            # compression_ratio = max(compression_ratio - (1 if compression_ratio % 2 == 0 else 0), 1)
             indicator = [
                     cot_start, # 当前cot开始位置
                     cot_end, # 当前结束位置，下一个位置应该是压缩token
-                    round((cot_end - cot_start) / len(comp_config.get_output_comp_token_id())), # 当前压缩率
+                    compression_ratio, # 当前压缩率
                     len(comp_config.get_output_comp_token_id()) # 压缩token数量
                 ]
             # 更新cot位置
             cot_start = cot_end
             position_ids = token_utils.use_epl_for_compression(position_ids, indicator)
-            # print("After EPL:", position_ids)
             use_compression_all_count += len(comp_config.get_output_comp_token_id())
-        # print("After EPL:", position_ids)
+        # print("position_ids:", position_ids)
+
         if DEBUG:
             if update_attention_method == 'global':
                 DebugUtils.show_global_attention(
@@ -1381,10 +1389,6 @@ def _sentence_level_generate(
             model_output=model_output, idx=-1
         )
         debug_count += 1
-        # if debug_count%70==0:
-        #     predicted_token_id = torch.tensor(151665)
-        # if debug_count%280==0:
-        #     predicted_token_id = eos_token_id
         new_token_counters += 1
 
     token_utils.show_output_input_ids.append(predicted_token_id)
