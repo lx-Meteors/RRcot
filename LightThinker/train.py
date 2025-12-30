@@ -8,6 +8,7 @@ from copy import deepcopy
 from model_qwen import Qwen2ForCausalLM
 from model_llama import LlamaForCausalLM
 from transformers import Trainer, TrainingArguments
+import copy
 # from torch.serialization import safe_globals
 # from deepspeed.runtime.zero.config import ZeroStageEnum
 # from deepspeed.runtime.fp16.loss_scaler import LossScaler
@@ -99,6 +100,7 @@ def get_parser():
     parser.add_argument('--lr_scheduler_type', type=str, default='linear')
 
     parser.add_argument('--use_EPL', type=str2bool, default=False)
+    parser.add_argument('--use_aux_model', type=str2bool, default=False)
     args = parser.parse_args()
     return args
 
@@ -131,7 +133,7 @@ def get_model_and_tokenizer(
     else:
         assert False, "We only support llama and qwen model."
     model = model_class.from_pretrained(
-        args.model_path, torch_dtype=torch.bfloat16
+        args.model_path, torch_dtype=torch.bfloat16, use_aux_model=args.use_aux_model
     )
 
     model.add_qkv(
@@ -147,6 +149,11 @@ def get_model_and_tokenizer(
         model.resize_token_embeddings(len(tokenizer), mean_resizing=False)
         _print(f"now.embedding.shape={model.model.embed_tokens.weight.shape}")
         _print(f"now.lm_head.shape={model.lm_head.weight.shape}")
+        
+        if args.use_aux_model:
+            model.model_aux.resize_token_embeddings(len(tokenizer), mean_resizing=False)
+            _print(f"now.embedding.shape={model.model_aux.model.embed_tokens.weight.shape}")
+            _print(f"now.lm_head.shape={model.model_aux.lm_head.weight.shape}")
     
     if args.freeze_model:
         _print(f"Freezing Model:\nnew_token: {len(special_token_list)}\norigin_length: {len(tokenizer) - len(special_token_list)}")
@@ -201,7 +208,7 @@ def get_dataset_and_data_collator(
         output_compress_instruction=args.output_compress_instruction,
         cache_dir=cache_dir,
         cache_filename=cache_filename,
-        force_preprocess=False,
+        force_preprocess=True,
         local_rank=local_rank,
         use_EPL=args.use_EPL,
     )

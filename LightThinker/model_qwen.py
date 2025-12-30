@@ -50,8 +50,8 @@ from transformers.utils import (
     replace_return_docstrings,
 )
 from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
-
-
+from transformers import AutoConfig, AutoModelForCausalLM
+import copy
 if is_flash_attn_2_available():
     from ...modeling_flash_attention_utils import _flash_attention_forward
 
@@ -1141,14 +1141,20 @@ class Qwen2Model(Qwen2PreTrainedModel):
 class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
 
-    def __init__(self, config):
+    def __init__(self, config, **kwargs):
         super().__init__(config)
         self.model = Qwen2Model(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-
+        self.use_aux_model = kwargs.get("use_aux_model",False)
         # Initialize weights and apply final processing
         self.post_init()
+        if self.use_aux_model:
+            # 深拷贝一份
+            aux_config = copy.deepcopy(config)
+            # 关键：改成 2 层
+            aux_config.num_hidden_layers = 2
+            self.model_aux = Qwen2ForCausalLM(aux_config)
         
     def add_qkv(self, q:bool=False, k:bool=False, v:bool=False):
         for decoder_layer in self.model.layers:
@@ -1207,6 +1213,7 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
         num_logits_to_keep: int = 0,
         row_comp_index: Optional[torch.Tensor]=None,
         column_comp_index: Optional[torch.Tensor]=None,
+        aux_labels: Optional[torch.LongTensor] = None,
         **loss_kwargs,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
@@ -1239,7 +1246,6 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
         >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
         "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
         ```"""
-
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -1255,7 +1261,7 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
             output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
+            output_hidden_states=True,
             return_dict=return_dict,
             cache_position=cache_position,
             row_comp_index=row_comp_index,
@@ -1269,6 +1275,28 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
         loss = None
         if labels is not None:
             loss = self.loss_function(logits, labels, self.vocab_size, **loss_kwargs)
+
+        inputs_embeds = outputs.hidden_states[14]
+        if self.use_aux_model:
+            aux_output = self.model_aux.model(
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+                cache_position=cache_position,
+                row_comp_index=row_comp_index,
+                column_comp_index=column_comp_index,
+            )
+            aux_hidden_states = aux_output[0]
+            # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
+            aux_logits = self.model_aux.lm_head(aux_hidden_states[:, -num_logits_to_keep:, :])
+            if aux_labels is not None:
+                aux_loss = self.loss_function(aux_logits, aux_labels, self.vocab_size, **loss_kwargs)
+                loss += aux_loss
 
         if not return_dict:
             output = (logits,) + outputs[1:]

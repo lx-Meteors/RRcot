@@ -184,10 +184,11 @@ class Tokenizer:
             labels=list(),
             locate_index=list(),
             position_ids=list(),
-            locate_indicator=list()
+            locate_indicator=list(),
+            aux_labels=list()
         )
         compression_count = 0
-        subtract_compressed_token = False
+        begin_solution_started = False
         for i in range(len(tokenized_label_list)):
             if len(final_item['input_ids']) >= max_length:
                 break
@@ -241,7 +242,7 @@ class Tokenizer:
                             
                         else:
                             compressed_positions = None
-                
+
                 if use_EPL and structured_input_indicator[i][j] == 'compressed-output':
                     compression_count += n_compressed
                     for k in range(len(tokenized_label_list[i][j])):
@@ -257,6 +258,7 @@ class Tokenizer:
                         
                         final_item['input_ids'].append(tokenized_input_id_list[i][j][k])
                         final_item['labels'].append(tokenized_label_list[i][j][k])
+                        final_item['aux_labels'].append(-100)
                 else:
                     for k in range(len(tokenized_label_list[i][j])):
                         if len(final_item['input_ids']) >= max_length:
@@ -268,6 +270,13 @@ class Tokenizer:
                         final_item['labels'].append(
                             tokenized_label_list[i][j][k]
                         )
+                        # 处理aux_labels（从<|begin_of_solution|>开始）
+                        if tokenized_label_list[i][j][k]==151670:
+                            begin_solution_started = True
+                        if begin_solution_started:
+                            final_item['aux_labels'].append(tokenized_label_list[i][j][k])
+                        else:
+                            final_item['aux_labels'].append(-100)
 
         # 4. recover
         # we do not use revover mode

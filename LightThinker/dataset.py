@@ -945,6 +945,7 @@ class MyDataCollator:
             position_ids=list(),
             row_comp_index=list(),
             column_comp_index=list(),
+            aux_labels=list(),
         )
         for bsz_id, instance in enumerate(instances):
             _, _, _, _, aug_data = instance
@@ -973,6 +974,7 @@ class MyDataCollator:
             final['input_ids'].append(new_item['input_ids'])
             final['labels'].append(new_item['labels'])
             final['position_ids'].append(new_item['position_ids'])
+            final['aux_labels'].append(new_item['aux_labels'])
             # row and column
             temp_column_list = list()
             temp_row_list = list()
@@ -1004,6 +1006,9 @@ class MyDataCollator:
             ),
             column_comp_index=torch.as_tensor(
                 final['column_comp_index']
+            ),
+            aux_labels=torch.as_tensor(
+                final['aux_labels']
             ),
         )
 

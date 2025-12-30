@@ -59,11 +59,13 @@ def padding_item(
     if padding_side == 'left':
         copy_item['input_ids'] = remainder_for_input + copy_item['input_ids']
         copy_item['labels'] = remainder_for_label + copy_item['labels']
+        copy_item['aux_labels'] = remainder_for_label + copy_item['aux_labels']
         if remainder_for_position_ids:
             copy_item['position_ids'] = remainder_for_position_ids + copy_item['position_ids']
     else:
         copy_item['input_ids'] = copy_item['input_ids'] + remainder_for_input
         copy_item['labels'] = copy_item['labels'] + remainder_for_label
+        copy_item['aux_labels'] = copy_item['aux_labels'] + remainder_for_label
         if remainder_for_position_ids:
             copy_item['position_ids'] = copy_item['position_ids'] + remainder_for_position_ids
     
