@@ -270,13 +270,14 @@ class Tokenizer:
                         final_item['labels'].append(
                             tokenized_label_list[i][j][k]
                         )
-                        # 处理aux_labels（从<|begin_of_solution|>开始）
-                        if tokenized_label_list[i][j][k]==151670:
+                        # 处理aux_labels（从<|end_of_thought|>开始）
+                        if tokenized_label_list[i][j][k]==151669:
                             begin_solution_started = True
                         if begin_solution_started:
                             final_item['aux_labels'].append(tokenized_label_list[i][j][k])
                         else:
                             final_item['aux_labels'].append(-100)
+                # print(self.tokenizer.decode(final_item['input_ids']))
 
         # 4. recover
         # we do not use revover mode

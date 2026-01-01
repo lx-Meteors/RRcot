@@ -946,11 +946,11 @@ class MyDataCollator:
             row_comp_index=list(),
             column_comp_index=list(),
             aux_labels=list(),
+            aux_attention_mask=list(),
         )
         for bsz_id, instance in enumerate(instances):
             _, _, _, _, aug_data = instance
-            final['attention_mask'].append(
-                create_attention_for_aug_data(
+            attention_mask, aux_attention_mask = create_attention_for_aug_data(
                     input_ids=aug_data['tokenized']['input_ids'],
                     locate_index_list=aug_data['tokenized']['locate_index'],
                     # [start, end, n_inst]
@@ -962,7 +962,8 @@ class MyDataCollator:
                     max_length=self.dataset.padding_config['max_length'],
                     prefill_compress=False,
                 )
-            )
+            final['attention_mask'].append(attention_mask)
+            final['aux_attention_mask'].append(aux_attention_mask)
             new_item = padding_item(
                 item=aug_data['tokenized'],
                 padding_side=self.dataset.padding_config['padding_side'],
@@ -1009,6 +1010,10 @@ class MyDataCollator:
             ),
             aux_labels=torch.as_tensor(
                 final['aux_labels']
+            ),
+            aux_attention_mask=create_attention_mask(
+                final['aux_attention_mask'],
+                dtype=torch.bfloat16
             ),
         )
 

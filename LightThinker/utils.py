@@ -89,6 +89,7 @@ def create_attention_for_aug_data(
     length = len(input_ids)
     mask = np.ones([length, length], dtype=np.bool)
     mask = np.tril(mask)#下三角矩阵
+    aux_mask = mask.copy()
 
     assert len(locate_index_list) == len(locate_indicator_list)
 
@@ -107,7 +108,10 @@ def create_attention_for_aug_data(
             if pre_n_continue is not None and pre_n_continue != 0:
                 mask[end+l_inst+n_comp:, pre_end+pre_n_inst+pre_n_comp:pre_end+pre_n_inst+pre_n_comp+pre_n_continue] = 0
         else:
+            # 后面的token都不准再看当前cot了
             mask[end+l_inst+n_comp:, start:end+l_inst] = 0
+            # 不管你是啥，都不要看cot了
+            aux_mask[end+l_inst:, start:end+l_inst] = 0
 
         # 1.1 prefill remove compress（默认为true，可以忽略）
         if not prefill_compress and index_state == 'compressed-prompt':
@@ -149,10 +153,17 @@ def create_attention_for_aug_data(
         padding_mask[:length, :length] = mask
         padding_mask[length:, :length] = mask[-1:]
         results = torch.as_tensor(padding_mask)
+
+
+        aux_padding_mask = np.zeros([max_length, max_length], dtype=np.bool)
+        aux_padding_mask[:length, :length] = aux_mask
+        aux_padding_mask[length:, :length] = aux_mask[-1:]
+        aux_results = torch.as_tensor(aux_padding_mask)
     else:
         results = torch.as_tensor(mask)
+        aux_results = torch.as_tensor(aux_mask)
 
-    return results
+    return results, aux_results
 
 def create_attention_for_recover_data(
     input_ids:List[int],

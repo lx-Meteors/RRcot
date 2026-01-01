@@ -135,7 +135,8 @@ def get_model_and_tokenizer(
     model = model_class.from_pretrained(
         args.model_path, torch_dtype=torch.bfloat16, use_aux_model=args.use_aux_model
     )
-
+    if args.use_aux_model:
+        model.model_aux.lm_head.load_state_dict(model.lm_head.state_dict())
     model.add_qkv(
         q='q' in args.qkv,
         k='k' in args.qkv,

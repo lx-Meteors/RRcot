@@ -1214,6 +1214,7 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
         row_comp_index: Optional[torch.Tensor]=None,
         column_comp_index: Optional[torch.Tensor]=None,
         aux_labels: Optional[torch.LongTensor] = None,
+        aux_attention_mask: Optional[torch.Tensor] = None,
         **loss_kwargs,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
@@ -1276,10 +1277,10 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
         if labels is not None:
             loss = self.loss_function(logits, labels, self.vocab_size, **loss_kwargs)
 
-        inputs_embeds = outputs.hidden_states[14]
+        inputs_embeds = outputs.hidden_states[len(outputs.hidden_states) // 2]
         if self.use_aux_model:
             aux_output = self.model_aux.model(
-                attention_mask=attention_mask,
+                attention_mask=aux_attention_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
                 inputs_embeds=inputs_embeds,
