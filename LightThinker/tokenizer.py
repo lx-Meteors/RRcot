@@ -270,8 +270,8 @@ class Tokenizer:
                         final_item['labels'].append(
                             tokenized_label_list[i][j][k]
                         )
-                        # 处理aux_labels（从<|end_of_thought|>开始）
-                        if tokenized_label_list[i][j][k]==151669:
+                        # 处理aux_labels（从<|begin of solution|>开始）
+                        if tokenized_label_list[i][j][k]==151670:
                             begin_solution_started = True
                         if begin_solution_started:
                             final_item['aux_labels'].append(tokenized_label_list[i][j][k])
