@@ -41,7 +41,7 @@
             "wait_budget_tokens": 256,
             "memory_budget_tokens": 256,
             "global_budget_tokens": 256,
-            "prompt_keep": 0,
+            "prompt_keep": 256,
             "attention_weight": 1.0,
             "impact_weight": 0.25,
             "novelty_weight": 0.2,
