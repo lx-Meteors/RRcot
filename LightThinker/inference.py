@@ -32,6 +32,58 @@ INDICATOR_LIST:List[str] = [
     _ABANDONED
 ]
 
+
+class H2ODynamicCache(DynamicCache):
+    """Dynamic cache with heavy-hitter + recent-token slimming (H2O)."""
+
+    def __init__(self, window_length: int, num_hh_tokens: int):
+        super().__init__()
+        self.window_length = int(window_length)
+        self.num_hh_tokens = int(num_hh_tokens)
+        self.accumulated_attention_scores: List[torch.Tensor] = []
+
+    @torch.no_grad()
+    def update_slimming(self, attention_scores: torch.Tensor, num_kv_groups: int, layer_idx: int):
+        # attention_scores: [bs, num_heads, q_len, k_len]
+        if len(self.accumulated_attention_scores) <= layer_idx:
+            self.accumulated_attention_scores.append(attention_scores.sum(2)[:, ::num_kv_groups, :])
+        else:
+            num_new_tokens = attention_scores.shape[2]
+            updated_attention_scores = attention_scores.sum(2)[:, ::num_kv_groups, :]
+            updated_attention_scores[:, :, :-num_new_tokens] += self.accumulated_attention_scores[layer_idx]
+            self.accumulated_attention_scores[layer_idx] = updated_attention_scores
+
+        if self.get_seq_length(layer_idx) <= self.window_length:
+            return
+
+        seq_len = self.get_seq_length(layer_idx)
+        seq_scores = self.accumulated_attention_scores[layer_idx][:, :, :-self.window_length + self.num_hh_tokens]
+
+        _, keep_hh_idx = torch.topk(seq_scores, self.num_hh_tokens, dim=-1)
+        keep_hh_idx = keep_hh_idx.sort(dim=-1).values
+
+        keep_local_idx = torch.arange(
+            seq_len - (self.window_length - self.num_hh_tokens),
+            seq_len,
+            device=keep_hh_idx.device,
+        ).repeat(keep_hh_idx.shape[0], keep_hh_idx.shape[1], 1)
+
+        keep_idx = torch.cat([keep_hh_idx, keep_local_idx], dim=-1)
+
+        mask = torch.zeros(
+            self.accumulated_attention_scores[layer_idx].shape,
+            dtype=torch.bool,
+            device=keep_hh_idx.device,
+        )
+        mask = mask.scatter(-1, keep_idx, 1)
+
+        bsz, num_heads, _, head_dim = self.key_cache[layer_idx].shape
+        self.key_cache[layer_idx] = self.key_cache[layer_idx][mask].view(bsz, num_heads, -1, head_dim)
+        self.value_cache[layer_idx] = self.value_cache[layer_idx][mask].view(bsz, num_heads, -1, head_dim)
+        self.accumulated_attention_scores[layer_idx] = self.accumulated_attention_scores[layer_idx][mask].view(
+            bsz, num_heads, -1
+        )
+
 class DebugUtils:
 
     @classmethod
@@ -592,8 +644,14 @@ class KVUtils:
     KV Cache Manager
     """
 
-    def __init__(self):
-        self.past_key_values: DynamicCache = DynamicCache()
+    def __init__(self, h2o_config: Dict = None):
+        h2o_config = h2o_config or {}
+        if bool(h2o_config.get("use_h2o", False)):
+            window_length = int(h2o_config.get("window_length", 2040))
+            num_hh_tokens = int(h2o_config.get("num_hh_tokens", max(1, window_length // 2)))
+            self.past_key_values: DynamicCache = H2ODynamicCache(window_length=window_length, num_hh_tokens=num_hh_tokens)
+        else:
+            self.past_key_values: DynamicCache = DynamicCache()
 
     def get_cache(self) -> DynamicCache:
         return self.past_key_values
@@ -629,7 +687,19 @@ class KVUtils:
             self.past_key_values.value_cache[layer_id] = \
                 self.past_key_values.value_cache[layer_id][:, :, 0:new_q_length, :]
 
+            if hasattr(self.past_key_values, "accumulated_attention_scores") and \
+                len(self.past_key_values.accumulated_attention_scores) > layer_id:
+                scores = self.past_key_values.accumulated_attention_scores[layer_id]
+                if scores.shape[-1] > end:
+                    if new_q_length > end:
+                        scores[:, :, start:new_q_length] = scores[:, :, end:]
+                    else:
+                        scores[:, :, start:new_q_length] = scores[:, :, end:q_length]
+                self.past_key_values.accumulated_attention_scores[layer_id] = scores[:, :, 0:new_q_length]
+
     def __del__(self):
+        if hasattr(self.past_key_values, "accumulated_attention_scores"):
+            del self.past_key_values.accumulated_attention_scores
         del self.past_key_values.value_cache
         del self.past_key_values.key_cache
         del self.past_key_values
@@ -1880,10 +1950,11 @@ def generate(
     use_EPL:bool=False,
     repetition_penalty:float=1.0,
     spec_decode:bool=False,
+    h2o_config:Dict=None,
 ) -> Tuple[str,str]:
 
     assert update_attention_method in ['global', 'local'], update_attention_method
-    kv_utils = KVUtils()
+    kv_utils = KVUtils(h2o_config=h2o_config)
 
     # 1. prefill
     predicted_token_id, last_hidden_state = prefill(
@@ -1996,6 +2067,9 @@ def get_parser():
     parser.add_argument('--index', type=int)        
     parser.add_argument('--use_EPL', type=str2bool, default=False)
     parser.add_argument('--spec_decode', type=str2bool, default=False)
+    parser.add_argument('--use_h2o', type=str2bool, default=True)
+    parser.add_argument('--h2o_window_length', type=int, default=2040)
+    parser.add_argument('--h2o_num_hh_tokens', type=int, default=1020)
     parser.add_argument(
         '--datasets',
         type=str,
@@ -2037,7 +2111,10 @@ def get_model_and_tokenizer(
 
     if args.model_type.lower() == 'qwen':
         model = Qwen2ForCausalLM.from_pretrained(
-            model_path, torch_dtype=torch.bfloat16, device_map="auto"
+            model_path,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+            attn_implementation="eager",
         )
     elif args.model_type.lower() == 'llama':
         model = LlamaForCausalLM.from_pretrained(
@@ -2075,6 +2152,7 @@ def eval_dataset(
     index:int=None,
     use_EPL:bool=False,
     spec_decode:bool=False,
+    h2o_config:Dict=None,
 ):
 
     if split_size != None and index != None:
@@ -2182,6 +2260,7 @@ def eval_dataset(
                 use_EPL=use_EPL,
                 repetition_penalty=repetition_penalty,
                 spec_decode=spec_decode,
+                h2o_config=h2o_config,
             )
             end_time = time.time()
             input_len:int = len(token_utils.show_prompt_input_ids)
@@ -2240,6 +2319,12 @@ def main():
         args, comp_config
     )
 
+    h2o_config = dict(
+        use_h2o=args.use_h2o,
+        window_length=args.h2o_window_length,
+        num_hh_tokens=args.h2o_num_hh_tokens,
+    )
+
     all_tasks = {
         "mmlu": MMLUReader(),
         "gsm8k": GSM8KReader(),
@@ -2281,7 +2366,8 @@ def main():
             split_size=args.split_size,
             index=args.index,
             use_EPL=args.use_EPL,
-            spec_decode=args.spec_decode
+            spec_decode=args.spec_decode,
+            h2o_config=h2o_config,
         )
 
 if __name__ == '__main__':

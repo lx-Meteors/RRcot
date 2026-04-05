@@ -2,15 +2,16 @@ import os
 import json
 os.environ["TOKENIZERS_PARALLELISM"] = "false" 
 import argparse
-import random
-import numpy as np
 import torch
 from typing import *
 from tqdm import tqdm
 from copy import deepcopy
 from model_qwen import Qwen2ForCausalLM
 from model_llama import LlamaForCausalLM
-from transformers import Trainer, TrainingArguments, set_seed as hf_set_seed
+from transformers import Trainer, TrainingArguments, DynamicCache
+import deepspeed
+import torch.distributed as dist
+from datetime import timedelta  # 引入时间库
 from transformers import TrainerCallback
 from transformers.integrations import TensorBoardCallback
 
@@ -25,79 +26,20 @@ else:
     print("Running in single-GPU mode")
 # =========================================
 
+
+
+if not torch.distributed.is_initialized():
+    deepspeed.init_distributed(
+        dist_backend="nccl",
+        timeout=timedelta(minutes=120)
+    )
+
 from config import Config
-from LightThinker.utils import _print, IGNORE_LABEL_ID, str2bool, count_mtp_lm_loss_denominators
+from LightThinker.utils import _print, IGNORE_LABEL_ID, str2bool
 from tokenizer import Tokenizer
 from dataset import MyDataset, MyDataCollator
 
-
-class CustomTrainer(Trainer):
-    """
-    在「一次 optimizer step」内先 prefetch 全部 micro-batch，再为本 step 聚合 MTP / LM 各自的全局有效 token 数，
-    并注入 forward，使 fixed_cross_entropy 的 sum / N_global 与梯度累计、多卡 gather 语义一致。
-    """
-
-    def get_batch_samples(self, epoch_iterator, num_batches):
-        batch_samples = []
-        for _ in range(num_batches):
-            try:
-                batch_samples += [next(epoch_iterator)]
-            except StopIteration:
-                break
-
-        self._mtp_num_items_in_batch = None
-        self._lm_num_items_in_batch = None
-
-        if not self.model_accepts_loss_kwargs:
-            return batch_samples, None
-
-        num_items_in_batch = None
-        if len(batch_samples) > 0 and "labels" in batch_samples[0]:
-            try:
-                num_items_in_batch = sum((batch["labels"].ne(-100)).sum() for batch in batch_samples)
-            except (TypeError, AttributeError):
-                pass
-
-        mtp_total = 0
-        lm_total = 0
-        has_reg = False
-        for batch in batch_samples:
-            reg = batch.get("register_token_index", None)
-            if reg is not None:
-                has_reg = True
-                m, l = count_mtp_lm_loss_denominators(batch["labels"], reg)
-                mtp_total += m
-                lm_total += l
-
-        if self.args.average_tokens_across_devices and num_items_in_batch is not None:
-            num_items_in_batch = self.accelerator.gather(num_items_in_batch).sum().item()
-
-        if has_reg:
-            if self.args.average_tokens_across_devices:
-                device = self.args.device
-                mtp_t = torch.tensor(mtp_total, device=device, dtype=torch.long)
-                lm_t = torch.tensor(lm_total, device=device, dtype=torch.long)
-                mtp_total = self.accelerator.gather(mtp_t).sum().item()
-                lm_total = self.accelerator.gather(lm_t).sum().item()
-            self._mtp_num_items_in_batch = mtp_total
-            self._lm_num_items_in_batch = lm_total
-
-        return batch_samples, num_items_in_batch
-
-    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        if self.model_accepts_loss_kwargs:
-            loss_kwargs = {}
-            if num_items_in_batch is not None:
-                loss_kwargs["num_items_in_batch"] = num_items_in_batch
-            mtp_n = getattr(self, "_mtp_num_items_in_batch", None)
-            lm_n = getattr(self, "_lm_num_items_in_batch", None)
-            if mtp_n is not None:
-                loss_kwargs["mtp_num_items_in_batch"] = mtp_n
-            if lm_n is not None:
-                loss_kwargs["lm_num_items_in_batch"] = lm_n
-            inputs = {**inputs, **loss_kwargs}
-        return super().compute_loss(model, inputs, return_outputs=return_outputs, num_items_in_batch=None)
-
+from transformers import TrainerCallback
 
 class SaveTokenizerCallback(TrainerCallback):
     """保存checkpoint同时保存tokenizer"""
@@ -116,92 +58,238 @@ class SaveTokenizerCallback(TrainerCallback):
             self.tokenizer.save_pretrained(checkpoint_folder)
 
 
+
+
 # ==========================================
-# 额外记录 自定义loss 到 TensorBoard（按实际 batch 聚合）
+# 1. 定义外部存储容器 (用于暂存 Hook 抓取的数据)
 # ==========================================
-class LossTracker:
+class LossBuffer:
     def __init__(self):
-        self.micro_lm_sum = 0.0
-        self.micro_mtp_sum = 0.0
-        self.micro_total_sum = 0.0
-        self.micro_count = 0
-        self.window_lm_sum = 0.0
-        self.window_mtp_sum = 0.0
-        self.window_total_sum = 0.0
-        self.window_step_count = 0
+        self.history = []
+    
+    def clear(self):
+        self.history = []
 
-    def add_micro(self, lm_loss: float, mtp_loss: float, total_loss: float):
-        self.micro_lm_sum += float(lm_loss)
-        self.micro_mtp_sum += float(mtp_loss)
-        self.micro_total_sum += float(total_loss)
-        self.micro_count += 1
+# 实例化全局 Buffer
+loss_buffer = LossBuffer()
 
-    def flush_micro_to_step(self):
-        if self.micro_count == 0:
+
+class H2ODynamicCache(DynamicCache):
+    """Dynamic cache with heavy-hitter + recent-token slimming (H2O)."""
+
+    def __init__(self, window_length: int, num_hh_tokens: int):
+        super().__init__()
+        self.window_length = int(window_length)
+        self.num_hh_tokens = int(num_hh_tokens)
+        self.accumulated_attention_scores: List[torch.Tensor] = []
+
+    @torch.no_grad()
+    def update_slimming(self, attention_scores: torch.Tensor, num_kv_groups: int, layer_idx: int):
+        if len(self.accumulated_attention_scores) <= layer_idx:
+            self.accumulated_attention_scores.append(attention_scores.sum(2)[:, ::num_kv_groups, :])
+        else:
+            num_new_tokens = attention_scores.shape[2]
+            updated_attention_scores = attention_scores.sum(2)[:, ::num_kv_groups, :]
+            updated_attention_scores[:, :, :-num_new_tokens] += self.accumulated_attention_scores[layer_idx]
+            self.accumulated_attention_scores[layer_idx] = updated_attention_scores
+
+        if self.get_seq_length(layer_idx) <= self.window_length:
             return
-        # 一个 optimizer step 内多个 micro-batch 先求和，再作为一个“实际 batch”
-        self.window_lm_sum += self.micro_lm_sum
-        self.window_mtp_sum += self.micro_mtp_sum
-        self.window_total_sum += self.micro_total_sum
-        self.window_step_count += 1
-        self.micro_lm_sum = 0.0
-        self.micro_mtp_sum = 0.0
-        self.micro_total_sum = 0.0
-        self.micro_count = 0
 
-    def pop_window_avg(self):
-        if self.window_step_count == 0:
-            return None
-        avg_lm = self.window_lm_sum / self.window_step_count
-        avg_mtp = self.window_mtp_sum / self.window_step_count
-        avg_total = self.window_total_sum / self.window_step_count
-        self.window_lm_sum = 0.0
-        self.window_mtp_sum = 0.0
-        self.window_total_sum = 0.0
-        self.window_step_count = 0
-        return avg_lm, avg_mtp, avg_total
+        seq_len = self.get_seq_length(layer_idx)
+        seq_scores = self.accumulated_attention_scores[layer_idx][:, :, :-self.window_length + self.num_hh_tokens]
+        _, keep_hh_idx = torch.topk(seq_scores, self.num_hh_tokens, dim=-1)
+        keep_hh_idx = keep_hh_idx.sort(dim=-1).values
+
+        keep_local_idx = torch.arange(
+            seq_len - (self.window_length - self.num_hh_tokens),
+            seq_len,
+            device=keep_hh_idx.device,
+        ).repeat(keep_hh_idx.shape[0], keep_hh_idx.shape[1], 1)
+
+        keep_idx = torch.cat([keep_hh_idx, keep_local_idx], dim=-1)
+        mask = torch.zeros(
+            self.accumulated_attention_scores[layer_idx].shape,
+            dtype=torch.bool,
+            device=keep_hh_idx.device,
+        )
+        mask = mask.scatter(-1, keep_idx, 1)
+
+        bsz, num_heads, _, head_dim = self.key_cache[layer_idx].shape
+        self.key_cache[layer_idx] = self.key_cache[layer_idx][mask].view(bsz, num_heads, -1, head_dim)
+        self.value_cache[layer_idx] = self.value_cache[layer_idx][mask].view(bsz, num_heads, -1, head_dim)
+        self.accumulated_attention_scores[layer_idx] = self.accumulated_attention_scores[layer_idx][mask].view(
+            bsz, num_heads, -1
+        )
 
 
-loss_tracker = LossTracker()
+class H2OTrainer(Trainer):
 
+    def __init__(self, *args, use_h2o: bool = False, h2o_window_length: int = 2040, h2o_num_hh_tokens: int = 1020, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.use_h2o = bool(use_h2o)
+        self.h2o_window_length = int(h2o_window_length)
+        self.h2o_num_hh_tokens = int(h2o_num_hh_tokens)
 
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        if not self.use_h2o:
+            try:
+                return super().compute_loss(model, inputs, return_outputs=return_outputs, num_items_in_batch=num_items_in_batch)
+            except TypeError:
+                return super().compute_loss(model, inputs, return_outputs=return_outputs)
+
+        labels = inputs.get("labels", None)
+        model_inputs = dict(inputs)
+        model_inputs.pop("labels", None)
+
+        h2o_cache = H2ODynamicCache(
+            window_length=self.h2o_window_length,
+            num_hh_tokens=self.h2o_num_hh_tokens,
+        )
+        outputs = model(**model_inputs, labels=labels, past_key_values=h2o_cache, use_cache=True)
+        loss = outputs["loss"] if isinstance(outputs, dict) else outputs.loss
+        return (loss, outputs) if return_outputs else loss
+
+# ==========================================
+# 2. 定义 Hook 函数 (用于从模型 forward 中偷数据)
+# ==========================================
 def capture_loss_hook(module, input, output):
-    lm_loss = getattr(module, "_last_lm_loss", 0.0)
-    mtp_loss = getattr(module, "_last_mtp_loss", 0.0)
-    lm_weight = float(getattr(module, "lm_loss_weight", 1.0))
-    mtp_weight = float(getattr(module, "mtp_loss_weight", 1.0))
-    if isinstance(lm_loss, torch.Tensor):
-        lm_loss = lm_loss.detach().float().item()
-    if isinstance(mtp_loss, torch.Tensor):
-        mtp_loss = mtp_loss.detach().float().item()
-    total_loss = lm_weight * float(lm_loss) + mtp_weight * float(mtp_loss)
-    loss_tracker.add_micro(lm_loss, mtp_loss, total_loss)
+    """
+    修复版 Hook：自动处理 Tensor 和 float 类型不一致的问题
+    """
+    # 1. 获取属性，如果不存在则默认为 0.0
+    raw_lm = getattr(module, '_last_lm_loss', 0.0)
+    raw_mtp = getattr(module, '_last_mtp_loss', 0.0)
+    
+    # 2. 定义一个辅助逻辑：确保输出统一为 Tensor
+    # 这样 Callback 里的 .item() 才能正常工作
+    def safe_detach(val):
+        if isinstance(val, torch.Tensor):
+            return val.detach().cpu() # 移到 CPU 以节省显存
+        else:
+            return torch.tensor(float(val)) # 如果是 float，这就包装成 Tensor
+            
+    # 3. 存入 buffer
+    loss_buffer.history.append({
+        "lm": safe_detach(raw_lm),
+        "mtp": safe_detach(raw_mtp)
+    })
 
+# ==========================================
+# 3. 定义 Callback (用于汇总计算并写入 Log)
+# ==========================================
+class MTPLossCallback(TrainerCallback):
+    def __init__(self, buffer_instance):
+        self.buffer = buffer_instance
+        self.local_stats = {"lm_sum": 0.0, "mtp_sum": 0.0, "micro_count": 0}
 
-class CustomLossCallback(TrainerCallback):
     def on_step_end(self, args, state, control, **kwargs):
-        loss_tracker.flush_micro_to_step()
+        # 从外部 buffer 读取数据
+        history = self.buffer.history
+        
+        if not history:
+            return
+
+        # 统计当前 optimizer step 内所有 micro-batch 的损失总和与数量
+        local_step_lm_sum = sum(item["lm"].item() for item in history)
+        local_step_mtp_sum = sum(item["mtp"].item() for item in history)
+        micro_count = len(history)
+        
+        self.local_stats["lm_sum"] += local_step_lm_sum
+        self.local_stats["mtp_sum"] += local_step_mtp_sum
+        self.local_stats["micro_count"] += micro_count
+        
+        # 【关键】清空 Buffer，防止内存溢出和数据混淆
+        self.buffer.clear()
 
     def on_log(self, args, state, control, logs=None, **kwargs):
-        if logs is None:
-            return
-        window_avg = loss_tracker.pop_window_avg()
-        if window_avg is None:
-            return
-        lm_loss, mtp_loss, total_loss = window_avg
-        logs["lm_loss"] = round(float(lm_loss), 4)
-        logs["mtp_loss"] = round(float(mtp_loss), 4)
-        logs["step_total_loss"] = round(float(total_loss), 4)
-        # 终端/TensorBoard 的 loss 使用同一 step 口径与同一权重公式
-        logs["loss"] = round(float(total_loss), 4)
+        if logs is not None and self.local_stats["micro_count"] > 0:
+            local_lm_sum = self.local_stats["lm_sum"]
+            local_mtp_sum = self.local_stats["mtp_sum"]
+            local_micro_count = float(self.local_stats["micro_count"])
+            
+            # === DeepSpeed 多卡同步核心逻辑 ===
+            if dist.is_initialized():
+                # 同步 sum 与 count，做全局加权平均，避免卡间样本数不一致带来的偏差
+                metrics = torch.tensor(
+                    [local_lm_sum, local_mtp_sum, local_micro_count],
+                    dtype=torch.float64,
+                    device=args.device,
+                )
+                
+                # 所有显卡的数据相加 (ReduceOp.SUM)
+                dist.all_reduce(metrics, op=dist.ReduceOp.SUM)
+                
+                global_micro_count = max(metrics[2].item(), 1.0)
+                global_avg_lm = (metrics[0] / global_micro_count).item()
+                global_avg_mtp = (metrics[1] / global_micro_count).item()
+            else:
+                global_avg_lm = local_lm_sum / max(local_micro_count, 1.0)
+                global_avg_mtp = local_mtp_sum / max(local_micro_count, 1.0)
 
-def set_global_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-    hf_set_seed(seed)
+            model = kwargs.get("model", None)
+            if model is not None and hasattr(model, "module"):
+                model = model.module
+            mtp_lambda = float(getattr(model, "mtp_lambda", 1.0)) if model is not None else 1.0
+            global_avg_total = global_avg_lm + mtp_lambda * global_avg_mtp
+
+            # 写入 Log (Trainer 会自动发送给 TensorBoard)
+            # 覆盖 Trainer 默认 loss，使终端显示口径与 lm_loss/mtp_loss 一致
+            logs['loss'] = round(global_avg_total, 4)
+            logs['lm_loss'] = round(global_avg_lm, 4)
+            logs['mtp_loss'] = round(global_avg_mtp, 4)
+            
+            # 重置计数器
+            self.local_stats = {"lm_sum": 0.0, "mtp_sum": 0.0, "micro_count": 0}
+
+
+def init_mtp_from_last_layer(model) -> None:
+    if not hasattr(model, "mtp_modules") or getattr(model, "mtp_depth", 0) <= 0:
+        return
+    if not hasattr(model, "model") or not hasattr(model.model, "layers"):
+        return
+
+    last_layer = model.model.layers[-1]
+    with torch.no_grad():
+        def _format_key_list(keys, max_items: int = 5) -> str:
+            if not keys:
+                return "[]"
+            shown = keys[:max_items]
+            suffix = "" if len(keys) <= max_items else f"...(+{len(keys) - max_items})"
+            return f"{shown}{suffix}"
+
+        def _log_load(idx: int, name: str, result) -> None:
+            missing = list(result.missing_keys)
+            unexpected = list(result.unexpected_keys)
+            _print(
+                f"init mtp[{idx}] {name}: "
+                f"missing={len(missing)} { _format_key_list(missing) } "
+                f"unexpected={len(unexpected)} { _format_key_list(unexpected) }"
+            )
+
+        for idx, mtp_module in enumerate(model.mtp_modules):
+            res = mtp_module.self_attn.load_state_dict(last_layer.self_attn.state_dict(), strict=False)
+            _log_load(idx, "self_attn", res)
+            res = mtp_module.cross_attn.load_state_dict(last_layer.self_attn.state_dict(), strict=False)
+            _log_load(idx, "cross_attn(from self_attn)", res)
+            res = mtp_module.mlp.load_state_dict(last_layer.mlp.state_dict(), strict=False)
+            _log_load(idx, "mlp", res)
+
+
+def freeze_except_mtp(model):
+    for name, param in model.named_parameters():
+        param.requires_grad = False
+
+    for name, param in model.named_parameters():
+        if "mtp" in name:
+            param.requires_grad = True
+
+    # sanity check
+    print("Trainable parameters:")
+    for n, p in model.named_parameters():
+        if p.requires_grad:
+            print(n)
+
 
 def get_parser():
     parser = argparse.ArgumentParser()
@@ -237,16 +325,19 @@ def get_parser():
     parser.add_argument('--warmup_ratio', type=float, default=0.)
     parser.add_argument('--warmup_steps', type=int, default=0)
     parser.add_argument('--lr_scheduler_type', type=str, default='linear')
-    parser.add_argument('--seed', type=int, default=42)
 
     parser.add_argument('--use_EPL', type=str2bool, default=False)
+    parser.add_argument('--aux_config', type=str, default=None)
+    parser.add_argument('--use_h2o', type=str2bool, default=True)
+    parser.add_argument('--h2o_window_length', type=int, default=2040)
+    parser.add_argument('--h2o_num_hh_tokens', type=int, default=1020)
     args = parser.parse_args()
     return args
 
 def get_model_and_tokenizer(
     args,
     comp_config:Config
-) -> Tuple[Union[Qwen2ForCausalLM, LlamaForCausalLM], Tokenizer, Any]:
+) -> Tuple[Union[Qwen2ForCausalLM, LlamaForCausalLM], Tokenizer]:
 
     special_token_list:List[str] = list()
     special_token_desp_dict = dict()
@@ -273,25 +364,45 @@ def get_model_and_tokenizer(
     else:
         assert False, "We only support llama and qwen model."
 
-    if comp_config.mtp_cfg:
+    if args.aux_config is not None and args.aux_config != "None":
         _print(f"use ce + mtp loss...")
+        assert os.path.exists(args.aux_config)
         from transformers import AutoConfig
         model_config = AutoConfig.from_pretrained(args.model_path, trust_remote_code=True)
-        mtp_params = comp_config.mtp_cfg
-        _print(f"mtp config={mtp_params}")
+        with open(args.aux_config, "r", encoding='utf-8') as f:
+            mtp_params = json.load(f)
+        _print(f"auxiliary mtp config={mtp_params}")
+
+        if comp_config.forzen_model_train_mtp:
+            mtp_params["forzen_model_train_mtp"] = True
 
         model_config.update(mtp_params)
+        qwen_extra_kwargs = dict(attn_implementation="eager") if args.model_type == 'qwen' else {}
         model = model_class.from_pretrained(
-            args.model_path, config=model_config, torch_dtype=torch.bfloat16, trust_remote_code=True
+            args.model_path,
+            config=model_config,
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=True,
+            **qwen_extra_kwargs,
         )
+        if getattr(model_config, "init", False):
+            _print(f"initialize mtp from last layer...")
+            init_mtp_from_last_layer(model)
+        if comp_config.forzen_model_train_mtp:
+            freeze_except_mtp(model)
+    
     else:
         _print(f"use ce loss...")
+        qwen_extra_kwargs = dict(attn_implementation="eager") if args.model_type == 'qwen' else {}
         model = model_class.from_pretrained(
-            args.model_path, torch_dtype=torch.bfloat16
+            args.model_path,
+            torch_dtype=torch.bfloat16,
+            **qwen_extra_kwargs,
         )
-
-    hook_handle = model.register_forward_hook(capture_loss_hook)
     
+    # 1. 挂载钩子 (核心步骤)
+    hook_handle = model.register_forward_hook(capture_loss_hook)
+
     model.add_qkv(
         q='q' in args.qkv,
         k='k' in args.qkv,
@@ -333,7 +444,7 @@ def get_model_and_tokenizer(
     for param_name in trainable_params:
         print(param_name)
 
-    return model, tokenizer, hook_handle
+    return model, tokenizer,hook_handle
 
 def get_dataset_and_data_collator(
     args,
@@ -343,7 +454,12 @@ def get_dataset_and_data_collator(
     attention_config:Dict,
     sample_config:Dict,
 ) -> Tuple[MyDataset, MyDataCollator]:
-
+    
+    cache_dir=os.path.join(os.path.dirname(args.train_path),"dataset_cache")
+    tokenizer_name = os.path.basename(os.path.normpath(args.tokenizer_path))
+    dataset_name = os.path.splitext(os.path.basename(args.train_path))[0]
+    cache_filename=f"cache_{tokenizer_name}_{dataset_name}.pt"
+    
     dataset = MyDataset(
         file_path=args.train_path,
         config=comp_config,
@@ -352,6 +468,11 @@ def get_dataset_and_data_collator(
         train_on_input=args.train_on_input,
         change_rope=False,
         output_compress_instruction=args.output_compress_instruction,
+        # cache_dir=cache_dir,
+        cache_dir=None,
+        cache_filename=cache_filename,
+        force_preprocess=True,
+        local_rank=local_rank,
         use_EPL=args.use_EPL,
     )
 
@@ -367,7 +488,6 @@ def get_dataset_and_data_collator(
 
 def main():
     args = get_parser()
-    set_global_seed(args.seed)
     if args.output_compress_instruction == "None":
         args.output_compress_instruction = ""
     print(args)
@@ -413,10 +533,13 @@ def main():
         sample_config=sample_config,
     )
 
+    gradient_checkpointing = not args.use_h2o
+    model.config.use_cache = bool(args.use_h2o)
+
     training_config = TrainingArguments(
         lr_scheduler_type=args.lr_scheduler_type,
         local_rank=args.local_rank,
-        gradient_checkpointing=True,
+        gradient_checkpointing=gradient_checkpointing,
         num_train_epochs=args.epochs,
         learning_rate=args.lr,
         bf16=True,
@@ -435,15 +558,17 @@ def main():
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         warmup_steps=args.warmup_steps,
         warmup_ratio=args.warmup_ratio,
-        seed=args.seed,
     )
     
-    trainer = CustomTrainer(
+    trainer = H2OTrainer(
         model=model,
         train_dataset=dataset,
         args=training_config,
         data_collator=data_collator,
-        callbacks=[SaveTokenizerCallback(tokenizer), CustomLossCallback()]  # 增加 mtp_loss lm_loss 监控
+        use_h2o=args.use_h2o,
+        h2o_window_length=args.h2o_window_length,
+        h2o_num_hh_tokens=args.h2o_num_hh_tokens,
+        callbacks=[SaveTokenizerCallback(tokenizer), MTPLossCallback(loss_buffer)]  # 添加回调
     )
 
     # 1. 弹出默认的 TensorBoardCallback (它目前排在队列最前面)
@@ -453,13 +578,15 @@ def main():
     if tb_callback is not None:
         trainer.add_callback(tb_callback)
 
-    try:
-        if resume_from_checkpoint:
-            trainer.train(resume_from_checkpoint=resume_from_checkpoint)
-        else:
-            trainer.train()
-    finally:
-        hook_handle.remove()
+    # 在加载检查点时使用上下文管理器
+    if resume_from_checkpoint and not comp_config.forzen_model_train_mtp:
+        trainer.train(resume_from_checkpoint=resume_from_checkpoint)
+    else:
+        trainer.train()
+
+    # 训练完成，显式移除钩子
+    hook_handle.remove()
+    print("Hook removed successfully.")
     
 
 
