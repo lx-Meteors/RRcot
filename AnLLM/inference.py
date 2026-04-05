@@ -1393,7 +1393,10 @@ def get_model_and_tokenizer(
 
     if args.model_type.lower() == 'qwen':
         model = Qwen2ForCausalLM.from_pretrained(
-            model_path, torch_dtype=torch.bfloat16, device_map="auto"
+            model_path,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+            attn_implementation="eager",
         )
     elif args.model_type.lower() == 'llama':
         model = LlamaForCausalLM.from_pretrained(

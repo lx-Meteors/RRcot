@@ -2,6 +2,7 @@
 
 import math
 from typing import *
+from copy import deepcopy
 from LightThinker.utils import read_json
 
 class Config:
@@ -52,6 +53,45 @@ class Config:
         self.compression_ratio:int = self.output_cfg['compression_ratio']
         self.forzen_model_train_mtp:bool = self.output_cfg['forzen_model_train_mtp']
         self.share_compression_token:bool = self.output_cfg['share_compression_token']
+
+        # 训练侧：随机历史 step 压缩 + recent step 保留 的采样配置
+        default_step_sampling_cfg = {
+            "enable": False,
+            "recent_keep": 1,
+            "recent_keep_tokens": -1,
+            "history_ratio": 0.5,
+            "history_min": 0,
+            "history_max": -1,
+            "max_compressed_steps": -1,
+            "global_anchor_keep": 0,
+            "global_anchor_tokens": -1,
+            "global_anchor_mode": "random",
+            "training_window_size": -1,
+            "strict_window": True,
+        }
+        self.output_step_sampling_cfg:Dict = deepcopy(default_step_sampling_cfg)
+        self.output_step_sampling_cfg.update(self.output_cfg.get("step_sampling", {}))
+
+        # 推理侧：固定 KV 预算下的结构化动态记忆配置
+        default_structured_memory_cfg = {
+            "enable": False,
+            "max_kv_budget": -1,
+            "recent_budget_tokens": 512,
+            "wait_budget_tokens": 256,
+            "memory_budget_tokens": 256,
+            "global_budget_tokens": 256,
+            "recent_window": 256,
+            "prompt_keep": 64,
+            "step_recent_keep": 32,
+            "step_anchor_keep": 8,
+            "global_anchor_budget": 96,
+            "attention_weight": 1.0,
+            "impact_weight": 0.2,
+            "novelty_weight": 0.2,
+            "decay": 0.995,
+        }
+        self.structured_memory_cfg:Dict = deepcopy(default_structured_memory_cfg)
+        self.structured_memory_cfg.update(self.output_cfg.get("structured_memory", {}))
 
         if self.share:
             assert self.output_comp_token_name_template == self.prompt_comp_token_name_template

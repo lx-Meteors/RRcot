@@ -23,6 +23,29 @@
         "meta_compress_step": 1,
         "compression_ratio": 5,
         "forzen_model_train_mtp": false,
-        "share_compression_token": false
+        "share_compression_token": false,
+        "step_sampling": {
+            "enable": true,
+            "recent_keep_tokens": 256,
+            "wait_budget_tokens": 128,
+            "global_anchor_tokens": 128,
+            "global_anchor_mode": "random",
+            "training_window_size": 512,
+            "memory_budget_tokens": 128,
+            "strict_window": true
+        },
+        "structured_memory": {
+            "enable": true,
+            "max_kv_budget": 1024,
+            "recent_budget_tokens": 512,
+            "wait_budget_tokens": 256,
+            "memory_budget_tokens": 256,
+            "global_budget_tokens": 256,
+            "prompt_keep": 0,
+            "attention_weight": 1.0,
+            "impact_weight": 0.25,
+            "novelty_weight": 0.2,
+            "decay": 0.995
+        }
     }
 }

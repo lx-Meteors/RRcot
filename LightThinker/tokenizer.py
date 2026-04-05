@@ -52,6 +52,56 @@ class Tokenizer:
     def __len__(self):
         return len(self.tokenizer)
 
+    def sample_compressed_steps(
+        self,
+        total_steps:int,
+        step_sampling_cfg:Optional[Dict]=None,
+        excluded_steps:Optional[Set[int]]=None,
+    ) -> Set[int]:
+        """
+        训练侧 step 采样策略：
+        - recent steps 默认保留（不压缩）
+        - 历史 steps 按比例随机采样压缩（稀疏压缩学习）
+        - excluded_steps 可用于排除 Global Anchors
+        """
+        if total_steps <= 0:
+            return set()
+
+        cfg = step_sampling_cfg or {}
+        if not cfg.get("enable", False):
+            return set(range(total_steps))
+
+        recent_keep = max(0, int(cfg.get("recent_keep", 1)))
+        recent_start = max(0, total_steps - recent_keep)
+        recent_indices = set(range(recent_start, total_steps))
+        exclude_set = set(excluded_steps or set()) | recent_indices
+
+        history_candidates = [idx for idx in range(total_steps) if idx not in exclude_set]
+        sampled_history: Set[int] = set()
+        if len(history_candidates) > 0:
+            history_ratio = float(cfg.get("history_ratio", 0.5))
+            history_ratio = min(max(history_ratio, 0.0), 1.0)
+            history_min = max(0, int(cfg.get("history_min", 0)))
+            history_max = int(cfg.get("history_max", -1))
+
+            n_history = int(round(len(history_candidates) * history_ratio))
+            n_history = max(n_history, history_min)
+            n_history = min(n_history, len(history_candidates))
+            if history_max >= 0:
+                n_history = min(n_history, history_max)
+
+            if n_history > 0:
+                sampled_history = set(random.sample(history_candidates, n_history))
+
+        selected = sampled_history
+
+        max_compressed_steps = int(cfg.get("max_compressed_steps", -1))
+        if max_compressed_steps >= 0 and len(selected) > max_compressed_steps:
+            trimmed = random.sample(sorted(list(selected)), max_compressed_steps)
+            selected = set(trimmed)
+
+        return selected
+
     def normal_data_tokenize(
         self,
         structured_input:List[str],

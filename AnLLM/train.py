@@ -78,8 +78,13 @@ def get_model_and_tokenizer(
     else:
         assert False, "We only support llama and qwen model."
 
+    model_load_kwargs = {
+        "torch_dtype": torch.bfloat16,
+    }
+    if args.model_type == 'qwen':
+        model_load_kwargs["attn_implementation"] = "eager"
     model = model_class.from_pretrained(
-        args.model_path, torch_dtype=torch.bfloat16
+        args.model_path, **model_load_kwargs
     )
 
     model.add_qkv(

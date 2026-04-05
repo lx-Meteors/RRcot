@@ -281,13 +281,25 @@ def get_model_and_tokenizer(
         _print(f"mtp config={mtp_params}")
 
         model_config.update(mtp_params)
+        model_load_kwargs = {
+            "config": model_config,
+            "torch_dtype": torch.bfloat16,
+            "trust_remote_code": True,
+        }
+        if args.model_type == 'qwen':
+            model_load_kwargs["attn_implementation"] = "eager"
         model = model_class.from_pretrained(
-            args.model_path, config=model_config, torch_dtype=torch.bfloat16, trust_remote_code=True
+            args.model_path, **model_load_kwargs
         )
     else:
         _print(f"use ce loss...")
+        model_load_kwargs = {
+            "torch_dtype": torch.bfloat16,
+        }
+        if args.model_type == 'qwen':
+            model_load_kwargs["attn_implementation"] = "eager"
         model = model_class.from_pretrained(
-            args.model_path, torch_dtype=torch.bfloat16
+            args.model_path, **model_load_kwargs
         )
 
     hook_handle = model.register_forward_hook(capture_loss_hook)

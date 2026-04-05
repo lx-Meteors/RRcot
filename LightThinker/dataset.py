@@ -4,6 +4,8 @@ from typing import List, Dict, Tuple, Union, Optional
 from tqdm import tqdm
 from copy import deepcopy
 import time
+import math
+import random
 
 from config import Config
 from tokenizer import Tokenizer
@@ -45,10 +47,224 @@ class MyDataset(torch.utils.data.Dataset):
         self.output_compress_instruction:str = output_compress_instruction if output_compress_instruction != None else ""
 
         self.use_EPL = use_EPL
+        self.output_step_sampling_cfg:Dict = deepcopy(self.config.output_step_sampling_cfg)
         
         # 预处理
         self.init()
         self.init_for_aug_data_wo_pc()
+
+    def _estimate_step_importance(
+        self,
+        thought:str,
+        running_freq:Dict[int, int],
+    ) -> float:
+        input_ids = self.tokenizer.tokenizer(
+            thought,
+            return_tensors=None,
+            add_special_tokens=False,
+        )['input_ids']
+        if len(input_ids) == 0:
+            return 0.0
+
+        novelty_sum = 0.0
+        for token_id in input_ids:
+            novelty_sum += 1.0 / math.sqrt(running_freq.get(token_id, 0) + 1.0)
+
+        uniq_ratio = len(set(input_ids)) / float(len(input_ids))
+        length_bonus = math.log1p(len(input_ids))
+        score = (novelty_sum / float(len(input_ids))) + 0.3 * uniq_ratio + 0.05 * length_bonus
+
+        for token_id in input_ids:
+            running_freq[token_id] = running_freq.get(token_id, 0) + 1
+        return score
+
+    def _tokenize_thought_steps(self, thoughts_list:List[str]) -> List[List[int]]:
+        tokenized_steps:List[List[int]] = []
+        for thought in thoughts_list:
+            tokenized_steps.append(
+                self.tokenizer.tokenizer(
+                    thought,
+                    return_tensors=None,
+                    add_special_tokens=False,
+                )['input_ids']
+            )
+        return tokenized_steps
+
+    def _plan_step_memory_groups(self, thoughts_list:List[str]) -> Tuple[set, set, set]:
+        total_steps = len(thoughts_list)
+        if total_steps == 0:
+            return set(), set(), set()
+
+        cfg = self.output_step_sampling_cfg or {}
+        if not cfg.get("enable", False):
+            return set(range(total_steps)), set(), set()
+
+        tokenized_steps = self._tokenize_thought_steps(thoughts_list)
+        step_token_lens = [len(x) for x in tokenized_steps]
+
+        # ===== recent token window =====
+        recent_keep_tokens = int(cfg.get("recent_keep_tokens", -1))
+        if recent_keep_tokens < 0:
+            recent_keep = max(0, int(cfg.get("recent_keep", 1)))
+            start_idx = max(0, total_steps - recent_keep)
+            recent_keep_tokens = sum(step_token_lens[start_idx:])
+        recent_keep_tokens = max(0, recent_keep_tokens)
+
+        recent_steps:set = set()
+        covered_recent_tokens = 0
+        if recent_keep_tokens > 0:
+            for step_idx in range(total_steps - 1, -1, -1):
+                if step_token_lens[step_idx] == 0:
+                    continue
+                recent_steps.add(step_idx)
+                covered_recent_tokens += step_token_lens[step_idx]
+                if covered_recent_tokens >= recent_keep_tokens:
+                    break
+
+        # ===== training window =====
+        training_window_size = int(cfg.get("training_window_size", -1))
+        if training_window_size < 0:
+            training_window_size = int(getattr(self.config, "structured_memory_cfg", {}).get("max_kv_budget", -1))
+        strict_window = bool(cfg.get("strict_window", True))
+
+        wait_budget_tokens = int(cfg.get("wait_budget_tokens", -1))
+        if wait_budget_tokens < 0:
+            wait_budget_tokens = int(getattr(self.config, "structured_memory_cfg", {}).get("wait_budget_tokens", 256))
+        wait_budget_tokens = max(1, wait_budget_tokens)
+
+        memory_budget_tokens = int(cfg.get("memory_budget_tokens", -1))
+        if memory_budget_tokens < 0:
+            memory_budget_tokens = int(getattr(self.config, "structured_memory_cfg", {}).get("memory_budget_tokens", 256))
+        memory_budget_tokens = max(0, memory_budget_tokens)
+
+        if training_window_size > 0:
+            # 若 recent 已超过窗口，优先保留更近的 recent steps
+            while len(recent_steps) > 0 and sum(step_token_lens[idx] for idx in recent_steps) > training_window_size:
+                oldest_recent = min(recent_steps)
+                recent_steps.remove(oldest_recent)
+
+        history_steps = [idx for idx in range(total_steps) if idx not in recent_steps]
+
+        # ===== global anchors (token-level sampling, step-level projection) =====
+        global_anchor_mode = str(cfg.get("global_anchor_mode", "random")).lower()
+        global_anchor_tokens = int(cfg.get("global_anchor_tokens", -1))
+        if global_anchor_tokens < 0:
+            global_anchor_keep = max(0, int(cfg.get("global_anchor_keep", 0)))
+            valid_lens = [x for x in step_token_lens if x > 0]
+            avg_len = (sum(valid_lens) // len(valid_lens)) if len(valid_lens) > 0 else 1
+            global_anchor_tokens = global_anchor_keep * max(1, avg_len)
+        global_anchor_tokens = max(0, global_anchor_tokens)
+
+        anchor_step_weight:Dict[int, float] = dict()
+        if global_anchor_tokens > 0 and len(history_steps) > 0:
+            if global_anchor_mode == "heuristic":
+                running_freq:Dict[int, int] = dict()
+                for step_idx in history_steps:
+                    anchor_step_weight[step_idx] = self._estimate_step_importance(thoughts_list[step_idx], running_freq)
+            else:
+                expanded_token_to_step:List[int] = []
+                for step_idx in history_steps:
+                    expanded_token_to_step.extend([step_idx] * step_token_lens[step_idx])
+                if len(expanded_token_to_step) > 0:
+                    n_sample = min(global_anchor_tokens, len(expanded_token_to_step))
+                    sampled_positions = random.sample(range(len(expanded_token_to_step)), n_sample)
+                    for pos in sampled_positions:
+                        step_idx = expanded_token_to_step[pos]
+                        anchor_step_weight[step_idx] = anchor_step_weight.get(step_idx, 0.0) + 1.0
+
+        ranked_anchor_steps = sorted(
+            anchor_step_weight.keys(),
+            key=lambda idx: (
+                anchor_step_weight[idx] / max(1, step_token_lens[idx]),
+                anchor_step_weight[idx],
+                -idx,
+            ),
+            reverse=True,
+        )
+
+        global_anchor_steps:set = set()
+        if training_window_size > 0:
+            recent_tokens = sum(step_token_lens[idx] for idx in recent_steps)
+            remain_budget = max(0, training_window_size - recent_tokens)
+            if strict_window:
+                # 为 Memory 预留预算，避免训练窗口里 Recent+Global 把空间吃满
+                remain_budget = max(0, remain_budget - memory_budget_tokens)
+            remain_budget = min(remain_budget, global_anchor_tokens)
+            for step_idx in ranked_anchor_steps:
+                step_len = step_token_lens[step_idx]
+                if step_len <= 0:
+                    continue
+                if step_len <= remain_budget:
+                    global_anchor_steps.add(step_idx)
+                    remain_budget -= step_len
+        else:
+            selected_tokens = 0
+            for step_idx in ranked_anchor_steps:
+                step_len = step_token_lens[step_idx]
+                if step_len <= 0:
+                    continue
+                if selected_tokens + step_len > global_anchor_tokens:
+                    continue
+                global_anchor_steps.add(step_idx)
+                selected_tokens += step_len
+
+        if strict_window and training_window_size > 0:
+            # 按 Wait budget 分批压缩：模拟 Recent 溢出 -> Wait 累计 -> 批压缩入 Memory
+            selected_comp_steps:set = set()
+            non_protected_steps = [
+                idx for idx in range(total_steps)
+                if idx not in recent_steps and idx not in global_anchor_steps
+            ]
+
+            wait_bucket:List[int] = []
+            wait_tokens = 0
+            memory_chunks:List[int] = []
+            memory_tokens = 0
+
+            for step_idx in non_protected_steps:
+                step_len = step_token_lens[step_idx]
+                if step_len <= 0:
+                    selected_comp_steps.add(step_idx)
+                    continue
+                wait_bucket.append(step_idx)
+                wait_tokens += step_len
+                if wait_tokens >= wait_budget_tokens:
+                    selected_comp_steps.update(wait_bucket)
+                    comp_token_len = len(self.config.get_output_comp_token_id(cot_length=max(1, wait_tokens)))
+                    memory_chunks.append(comp_token_len)
+                    memory_tokens += comp_token_len
+                    wait_bucket = []
+                    wait_tokens = 0
+
+                    # Memory FIFO 预算约束（与推理 memory 区上限一致）
+                    if memory_budget_tokens > 0:
+                        while memory_tokens > memory_budget_tokens and len(memory_chunks) > 0:
+                            memory_tokens -= memory_chunks.pop(0)
+
+            # 若尾部 Wait 未满但整体仍超训练窗口，强制触发一次尾部压缩
+            if len(wait_bucket) > 0:
+                recent_tokens = sum(step_token_lens[idx] for idx in recent_steps)
+                global_tokens = sum(step_token_lens[idx] for idx in global_anchor_steps)
+                tail_wait_tokens = sum(step_token_lens[idx] for idx in wait_bucket)
+                estimated_total = recent_tokens + global_tokens + memory_tokens + tail_wait_tokens
+                if estimated_total > training_window_size:
+                    selected_comp_steps.update(wait_bucket)
+                    tail_comp_len = len(self.config.get_output_comp_token_id(cot_length=max(1, tail_wait_tokens)))
+                    memory_chunks.append(tail_comp_len)
+                    memory_tokens += tail_comp_len
+                    wait_bucket = []
+
+                    if memory_budget_tokens > 0:
+                        while memory_tokens > memory_budget_tokens and len(memory_chunks) > 0:
+                            memory_tokens -= memory_chunks.pop(0)
+        else:
+            selected_comp_steps = self.tokenizer.sample_compressed_steps(
+                total_steps=total_steps,
+                step_sampling_cfg=cfg,
+                excluded_steps=recent_steps | global_anchor_steps,
+            )
+
+        return selected_comp_steps, recent_steps, global_anchor_steps
     
     #token level，感觉没用到
     def insert_comp_for_output(self, output:str) -> Tuple[List[str], List[List[int]]]:
@@ -325,15 +541,23 @@ class MyDataset(torch.utils.data.Dataset):
                 output_indicator_list, output_content_list = self.insert_comp_for_output(
                     gt_output + self.tokenizer.eos_token if add_eos else gt_output
                 )
+                selected_comp_steps = set()
+                recent_steps = set()
+                global_anchor_steps = set()
             else:
                 # sentence level
                 output_indicator_list = list()
                 output_content_list = list()
-                for thought in thoughts_list:
-                    output_indicator_list.append("abandoned")
-                    output_content_list.append(thought + '\n' + self.config.split_token)
-                    output_indicator_list.append("compressed-output")
-                    output_content_list.append(self.output_compress_instruction + self.config.get_output_comp_token(return_list=False) + self.config.continue_token)
+                selected_comp_steps, recent_steps, global_anchor_steps = self._plan_step_memory_groups(thoughts_list)
+                for step_idx, thought in enumerate(thoughts_list):
+                    if step_idx in selected_comp_steps:
+                        output_indicator_list.append("abandoned")
+                        output_content_list.append(thought + '\n' + self.config.split_token)
+                        output_indicator_list.append("compressed-output")
+                        output_content_list.append(self.output_compress_instruction + self.config.get_output_comp_token(return_list=False) + self.config.continue_token)
+                    else:
+                        output_indicator_list.append("save")
+                        output_content_list.append(thought + '\n')
                 if add_eos:
                     output_indicator_list.append("save")
                     output_content_list.append(self.tokenizer.eos_token)
@@ -357,7 +581,13 @@ class MyDataset(torch.utils.data.Dataset):
             self.aug_data.append(
                 dict(
                     meta_info=item,
-                    tokenized=aug_item,
+                    tokenized={
+                        **aug_item,
+                        "selected_comp_steps": sorted(list(selected_comp_steps)) if self.config.output_comp_level == 'sentence' else [],
+                        "recent_steps": sorted(list(recent_steps)) if self.config.output_comp_level == 'sentence' else [],
+                        "global_anchor_steps": sorted(list(global_anchor_steps)) if self.config.output_comp_level == 'sentence' else [],
+                        "total_thought_steps": len(thoughts_list),
+                    },
                 )
             )
             self.recover_data.append(
@@ -412,25 +642,33 @@ class MyDataset(torch.utils.data.Dataset):
                 assert False, "we don's support now"
 
             # 2.output
+            output_comp_adaptive_num_token = list()
             if self.config.output_comp_level == 'token':
                 output_indicator_list, output_content_list = self.insert_comp_for_output(
                     gt_output + self.tokenizer.eos_token if add_eos else gt_output
                 )
+                selected_comp_steps = set()
+                recent_steps = set()
+                global_anchor_steps = set()
             else:
                 # sentence level
                 output_indicator_list = list()
                 output_content_list = list()
-                output_comp_adaptive_num_token = list()
-                for thought in thoughts_list:
-                    output_indicator_list.append("abandoned")
-                    output_content_list.append(thought + '\n' + self.config.split_token)
-                    output_indicator_list.append("compressed-output")
-                    if self.config.compression_ratio > 0: # compression_ratio大于0则自适应压缩，等于-1则固定token压缩个数
-                        output_comp_tokens, num_comp_tokens = self.config.get_adaptive_output_comp_token(tokenizer=self.tokenizer, thought=thought)
-                        output_content_list.append(self.output_compress_instruction + output_comp_tokens + self.config.continue_token)
-                        output_comp_adaptive_num_token.append(num_comp_tokens)
+                selected_comp_steps, recent_steps, global_anchor_steps = self._plan_step_memory_groups(thoughts_list)
+                for step_idx, thought in enumerate(thoughts_list):
+                    if step_idx in selected_comp_steps:
+                        output_indicator_list.append("abandoned")
+                        output_content_list.append(thought + '\n' + self.config.split_token)
+                        output_indicator_list.append("compressed-output")
+                        if self.config.compression_ratio > 0: # compression_ratio大于0则自适应压缩，等于-1则固定token压缩个数
+                            output_comp_tokens, num_comp_tokens = self.config.get_adaptive_output_comp_token(tokenizer=self.tokenizer, thought=thought)
+                            output_content_list.append(self.output_compress_instruction + output_comp_tokens + self.config.continue_token)
+                            output_comp_adaptive_num_token.append(num_comp_tokens)
+                        else:
+                            output_content_list.append(self.output_compress_instruction + self.config.get_output_comp_token(return_list=False) + self.config.continue_token)
                     else:
-                        output_content_list.append(self.output_compress_instruction + self.config.get_output_comp_token(return_list=False) + self.config.continue_token)
+                        output_indicator_list.append("save")
+                        output_content_list.append(thought + '\n')
                 if add_eos:
                     output_indicator_list.append("save")
                     output_content_list.append(self.tokenizer.eos_token)
@@ -457,7 +695,13 @@ class MyDataset(torch.utils.data.Dataset):
             self.aug_data_wo_prompt_comp.append(
                 dict(
                     meta_info=item,
-                    tokenized=aug_item
+                    tokenized={
+                        **aug_item,
+                        "selected_comp_steps": sorted(list(selected_comp_steps)) if self.config.output_comp_level == 'sentence' else [],
+                        "recent_steps": sorted(list(recent_steps)) if self.config.output_comp_level == 'sentence' else [],
+                        "global_anchor_steps": sorted(list(global_anchor_steps)) if self.config.output_comp_level == 'sentence' else [],
+                        "total_thought_steps": len(thoughts_list),
+                    }
                 )
             )
 
@@ -486,7 +730,13 @@ class MyDataset(torch.utils.data.Dataset):
             self.aug_data_wo_prompt_comp_apa_mtp.append(
                 dict(
                     meta_info=item,
-                    tokenized=aug_item_register_mtp
+                    tokenized={
+                        **aug_item_register_mtp,
+                        "selected_comp_steps": sorted(list(selected_comp_steps)) if self.config.output_comp_level == 'sentence' else [],
+                        "recent_steps": sorted(list(recent_steps)) if self.config.output_comp_level == 'sentence' else [],
+                        "global_anchor_steps": sorted(list(global_anchor_steps)) if self.config.output_comp_level == 'sentence' else [],
+                        "total_thought_steps": len(thoughts_list),
+                    } if aug_item_register_mtp is not None else None
                 )
             )
 

@@ -594,12 +594,160 @@ class KVUtils:
 
     def __init__(self):
         self.past_key_values: DynamicCache = DynamicCache()
+        self.token_scores:List[float] = list()
+        self.token_impact:List[float] = list()
+        self.token_freq:Dict[int, int] = dict()
+        self.token_roles:List[str] = list()
+        self.wait_buffer_token_ids:List[int] = list()
 
     def get_cache(self) -> DynamicCache:
         return self.past_key_values
 
     def set_cache(self, past_key_values:DynamicCache):
         self.past_key_values = past_key_values
+
+    def _ensure_score_length(self, length:int):
+        if len(self.token_scores) < length:
+            delta = length - len(self.token_scores)
+            self.token_scores.extend([0.0] * delta)
+            self.token_impact.extend([0.0] * delta)
+        elif len(self.token_scores) > length:
+            self.token_scores = self.token_scores[:length]
+            self.token_impact = self.token_impact[:length]
+
+    def _ensure_role_length(self, length:int, fill_role:str="history"):
+        if len(self.token_roles) < length:
+            self.token_roles.extend([fill_role] * (length - len(self.token_roles)))
+        elif len(self.token_roles) > length:
+            self.token_roles = self.token_roles[:length]
+
+    def init_roles_from_tokens(self, token_ids:List[int], default_role:str="history"):
+        if len(self.token_roles) != 0:
+            return
+        if len(token_ids) == 0:
+            return
+        self.token_roles = [default_role] * len(token_ids)
+
+    def append_roles(self, roles:List[str]):
+        if len(roles) == 0:
+            return
+        self.token_roles.extend(roles)
+
+    def set_roles_by_indices(self, indices:List[int], role:str):
+        for idx in indices:
+            if 0 <= idx < len(self.token_roles):
+                self.token_roles[idx] = role
+
+    def append_wait_tokens(self, token_ids:List[int]):
+        if len(token_ids) == 0:
+            return
+        self.wait_buffer_token_ids.extend(token_ids)
+
+    def pop_wait_chunk(self, size:int) -> List[int]:
+        if size <= 0 or len(self.wait_buffer_token_ids) == 0:
+            return []
+        n = min(size, len(self.wait_buffer_token_ids))
+        chunk = self.wait_buffer_token_ids[:n]
+        self.wait_buffer_token_ids = self.wait_buffer_token_ids[n:]
+        return chunk
+
+    def init_scores_from_tokens(self, token_ids:List[int], novelty_weight:float=0.0):
+        if len(self.token_scores) != 0:
+            return
+        if len(token_ids) == 0:
+            return
+        self._ensure_score_length(len(token_ids))
+        for idx, token_id in enumerate(token_ids):
+            old_freq = self.token_freq.get(token_id, 0)
+            new_freq = old_freq + 1
+            self.token_freq[token_id] = new_freq
+            if novelty_weight > 0:
+                self.token_scores[idx] += float(novelty_weight) / float(np.sqrt(new_freq))
+
+    def append_scores_for_new_tokens(self, token_ids:List[int], novelty_weight:float=0.0):
+        if len(token_ids) == 0:
+            return
+        start = len(self.token_scores)
+        self.token_scores.extend([0.0] * len(token_ids))
+        self.token_impact.extend([0.0] * len(token_ids))
+        for offset, token_id in enumerate(token_ids):
+            old_freq = self.token_freq.get(token_id, 0)
+            new_freq = old_freq + 1
+            self.token_freq[token_id] = new_freq
+            if novelty_weight > 0:
+                self.token_scores[start + offset] += float(novelty_weight) / float(np.sqrt(new_freq))
+
+    def update_scores_from_attentions(
+        self,
+        attentions,
+        attention_weight:float=1.0,
+        impact_weight:float=0.0,
+        decay:float=1.0,
+    ):
+        if attentions is None:
+            return
+        if len(attentions) == 0:
+            return
+
+        # attentions: tuple[layer], each [bsz, n_head, q_len, kv_len]
+        agg = None
+        valid_layer_count = 0
+        for layer_attn in attentions:
+            if layer_attn is None:
+                continue
+            # mean over head and query token -> [kv_len]
+            layer_score = layer_attn.mean(dim=1).mean(dim=1).squeeze(0)
+            if agg is None:
+                agg = layer_score
+            else:
+                agg = agg + layer_score
+            valid_layer_count += 1
+
+        if agg is None or valid_layer_count == 0:
+            return
+
+        agg = agg / float(valid_layer_count)
+        kv_len = int(agg.shape[-1])
+        self._ensure_score_length(kv_len)
+
+        decay = float(decay)
+        attention_weight = float(attention_weight)
+        impact_weight = float(impact_weight)
+
+        score_list = agg.detach().float().cpu().tolist()
+        for idx in range(kv_len):
+            attn_val = float(score_list[idx])
+            self.token_impact[idx] = self.token_impact[idx] * decay + attn_val
+            self.token_scores[idx] = self.token_scores[idx] * decay + attention_weight * attn_val + impact_weight * self.token_impact[idx]
+
+    def get_score(self, idx:int) -> float:
+        if idx < 0 or idx >= len(self.token_scores):
+            return 0.0
+        return float(self.token_scores[idx])
+
+    def reduce_indices(self, token_utils:Any, remove_indices:List[int]) -> List[Tuple[int, int]]:
+        if len(remove_indices) == 0:
+            return []
+
+        uniq_indices = sorted(set(remove_indices))
+        merged_ranges:List[Tuple[int, int]] = []
+        start = uniq_indices[0]
+        prev = uniq_indices[0]
+        for idx in uniq_indices[1:]:
+            if idx == prev + 1:
+                prev = idx
+                continue
+            merged_ranges.append((start, prev + 1))
+            start = idx
+            prev = idx
+        merged_ranges.append((start, prev + 1))
+
+        # from right to left to keep indexes valid
+        for start, end in merged_ranges[::-1]:
+            self.reduce_cache(start=start, end=end)
+            token_utils.reduce_input_ids(start=start, end=end)
+
+        return merged_ranges
 
     @torch.no_grad()
     def reduce_cache(self, start:int, end:int):
@@ -629,7 +777,17 @@ class KVUtils:
             self.past_key_values.value_cache[layer_id] = \
                 self.past_key_values.value_cache[layer_id][:, :, 0:new_q_length, :]
 
+        if len(self.token_scores) >= end:
+            del self.token_scores[start:end]
+            del self.token_impact[start:end]
+        self._ensure_score_length(self.past_key_values._seen_tokens)
+        if len(self.token_roles) >= end:
+            del self.token_roles[start:end]
+        self._ensure_role_length(self.past_key_values._seen_tokens)
+
     def __del__(self):
+        self.token_roles.clear()
+        self.wait_buffer_token_ids.clear()
         del self.past_key_values.value_cache
         del self.past_key_values.key_cache
         del self.past_key_values
@@ -831,9 +989,12 @@ def _prefill_wo_prompt_compression(
     token_utils.show_prompt_input_ids.extend(input_ids)
     token_utils.set_input_ids(input_ids)
     if DEBUG:
+        debug_attention_mask = attn_utils.base_attn[
+            0:len(input_ids), 0:len(input_ids)
+        ].unsqueeze(dim=0).unsqueeze(dim=0)
         DebugUtils.show_global_attention(
             tokenizer=tokenizer,
-            attention_mask=attention_mask.squeeze().cpu().tolist(), 
+            attention_mask=debug_attention_mask.squeeze().cpu().tolist(), 
             input_ids=input_ids,
             position_ids=token_utils.get_position_ids().squeeze().cpu().tolist(),
             block=BLOCK,
@@ -1310,6 +1471,241 @@ def _token_level_generate(
     # return tokenizer.decode(token_utils._whole_input_ids)
     return tokenizer.decode(token_utils.show_prompt_input_ids), tokenizer.decode(token_utils.show_output_input_ids)
 
+
+def _select_keep_indices_within_step(
+    kv_utils:KVUtils,
+    start:int,
+    end:int,
+    step_recent_keep:int,
+    step_anchor_keep:int,
+) -> Set[int]:
+    """
+    [start, end) 对应一个待压缩 step（末尾通常是 splitter）。
+    - recent: 保留该 step 末尾若干 token
+    - anchor: 在剩余 token 中按重要性保留若干 token
+    """
+    if end <= start:
+        return set()
+
+    # 默认把最后一个 token 视为 splitter，不参与保留
+    body_end = max(start, end - 1)
+    body_indices = list(range(start, body_end))
+    if len(body_indices) == 0:
+        return set()
+
+    keep_indices:Set[int] = set()
+    if step_recent_keep > 0:
+        keep_indices.update(body_indices[-step_recent_keep:])
+
+    remain = [idx for idx in body_indices if idx not in keep_indices]
+    if step_anchor_keep > 0 and len(remain) > 0:
+        anchor_indices = sorted(
+            remain,
+            key=lambda idx: kv_utils.get_score(idx),
+            reverse=True
+        )[:step_anchor_keep]
+        keep_indices.update(anchor_indices)
+
+    return keep_indices
+
+
+def _enforce_structured_memory_budget(
+    kv_utils:KVUtils,
+    token_utils:TokenUtils,
+    comp_config:Config,
+    memory_cfg:Dict,
+    local_start:Optional[int]=None,
+) -> int:
+    max_kv_budget = int(memory_cfg.get("max_kv_budget", -1))
+    if max_kv_budget <= 0:
+        return local_start if local_start is not None else 0
+
+    cur_len = int(kv_utils.get_cache()._seen_tokens)
+    if cur_len <= 0:
+        return local_start if local_start is not None else 0
+
+    kv_utils._ensure_score_length(cur_len)
+    kv_utils._ensure_role_length(cur_len, fill_role="history")
+
+    prompt_keep = max(0, int(memory_cfg.get("prompt_keep", 0)))
+    recent_budget = int(memory_cfg.get("recent_budget_tokens", memory_cfg.get("recent_window", 256)))
+    memory_budget = int(memory_cfg.get("memory_budget_tokens", 256))
+    global_budget = int(memory_cfg.get("global_budget_tokens", memory_cfg.get("global_anchor_budget", 256)))
+    recent_budget = max(0, recent_budget)
+    memory_budget = max(0, memory_budget)
+    global_budget = max(0, global_budget)
+
+    prompt_protected:Set[int] = set(range(min(prompt_keep, cur_len)))
+
+    memory_indices_all = [idx for idx, role in enumerate(kv_utils.token_roles[:cur_len]) if role == "memory"]
+    if memory_budget > 0:
+        keep_memory = set(memory_indices_all[-memory_budget:])
+    else:
+        keep_memory = set()
+
+    recent_indices_all = [idx for idx, role in enumerate(kv_utils.token_roles[:cur_len]) if role == "recent"]
+    if recent_budget > 0:
+        keep_recent = set(recent_indices_all[-recent_budget:])
+    else:
+        keep_recent = set()
+
+    global_candidates = [
+        idx for idx in range(cur_len)
+        if idx not in prompt_protected and idx not in keep_recent and idx not in keep_memory
+    ]
+    global_candidates = sorted(global_candidates, key=lambda idx: kv_utils.get_score(idx), reverse=True)
+    keep_global = set(global_candidates[:global_budget])
+
+    protected = set(prompt_protected) | set(keep_recent) | set(keep_memory) | set(keep_global)
+
+    # 若受保护 token 超预算，按 global -> memory(最老) -> recent(最老) 依次回收
+    overflow = len(protected) - max_kv_budget
+    if overflow > 0 and len(keep_global) > 0:
+        global_sorted_low = sorted(list(keep_global), key=lambda idx: kv_utils.get_score(idx))
+        drop = set(global_sorted_low[:overflow])
+        keep_global -= drop
+        protected -= drop
+        overflow = len(protected) - max_kv_budget
+
+    if overflow > 0 and len(keep_memory) > 0:
+        memory_sorted_old = sorted(list(keep_memory))
+        drop = set(memory_sorted_old[:overflow])
+        keep_memory -= drop
+        protected -= drop
+        overflow = len(protected) - max_kv_budget
+
+    if overflow > 0 and len(keep_recent) > 0:
+        recent_sorted_old = sorted(list(keep_recent))
+        drop = set(recent_sorted_old[:overflow])
+        keep_recent -= drop
+        protected -= drop
+
+    remove_indices = [idx for idx in range(cur_len) if idx not in protected]
+    if len(remove_indices) == 0:
+        return local_start if local_start is not None else 0
+
+    removed_token_ids_for_wait:List[int] = []
+    for idx in remove_indices:
+        if idx < len(kv_utils.token_roles) and kv_utils.token_roles[idx] != "memory":
+            if idx < len(token_utils._current_input_ids):
+                removed_token_ids_for_wait.append(token_utils._current_input_ids[idx])
+    kv_utils.append_wait_tokens(removed_token_ids_for_wait)
+
+    kept_old_indices = [idx for idx in range(cur_len) if idx not in set(remove_indices)]
+    old_to_new = {old_idx: new_idx for new_idx, old_idx in enumerate(kept_old_indices)}
+    new_recent = [old_to_new[idx] for idx in keep_recent if idx in old_to_new]
+    new_memory = [old_to_new[idx] for idx in keep_memory if idx in old_to_new]
+    new_global = [old_to_new[idx] for idx in keep_global if idx in old_to_new]
+
+    kv_utils.reduce_indices(token_utils=token_utils, remove_indices=remove_indices)
+
+    # 重新标注角色，保证四层划分一致
+    kv_utils._ensure_role_length(kv_utils.get_cache()._seen_tokens, fill_role="history")
+    for i in range(len(kv_utils.token_roles)):
+        kv_utils.token_roles[i] = "history"
+    kv_utils.set_roles_by_indices(new_memory, "memory")
+    kv_utils.set_roles_by_indices(new_recent, "recent")
+    # global 与 recent/memory 冲突时，以 recent/memory 优先
+    non_conflict_global = [idx for idx in new_global if idx not in set(new_recent) and idx not in set(new_memory)]
+    kv_utils.set_roles_by_indices(non_conflict_global, "global")
+
+    if local_start is not None:
+        shift = sum(1 for idx in remove_indices if idx < local_start)
+        local_start = max(0, local_start - shift)
+        return local_start
+    return 0
+
+
+def _roles_for_new_tokens(new_input_ids:List[int], comp_config:Config) -> List[str]:
+    memory_token_ids = set(comp_config.get_output_comp_token_id())
+    memory_token_ids.add(comp_config.continue_token_id)
+    roles = []
+    for token_id in new_input_ids:
+        if token_id in memory_token_ids:
+            roles.append("memory")
+        else:
+            roles.append("recent")
+    return roles
+
+
+@torch.no_grad()
+def _flush_wait_buffer_to_memory(
+    model:Union[LlamaForCausalLM, Qwen2ForCausalLM],
+    comp_config:Config,
+    memory_cfg:Dict,
+    attn_utils:AttentionUtils,
+    kv_utils:KVUtils,
+    token_utils:TokenUtils,
+    use_EPL:bool,
+    use_compression_all_count:int,
+    use_structured_memory:bool,
+    attention_weight:float,
+    impact_weight:float,
+    novelty_weight:float,
+    decay:float,
+    local_start:int,
+) -> int:
+    wait_budget = int(memory_cfg.get("wait_budget_tokens", 256))
+    wait_budget = max(1, wait_budget)
+
+    while len(kv_utils.wait_buffer_token_ids) >= wait_budget:
+        wait_chunk = kv_utils.pop_wait_chunk(wait_budget)
+        if len(wait_chunk) == 0:
+            break
+
+        comp_tokens = comp_config.get_output_comp_token_id(cot_length=len(wait_chunk))
+        if len(comp_tokens) == 0:
+            continue
+
+        merged_input_ids = wait_chunk + comp_tokens
+        if token_utils.max_length < token_utils._seen_tokens + len(merged_input_ids):
+            kv_utils.wait_buffer_token_ids = wait_chunk + kv_utils.wait_buffer_token_ids
+            break
+
+        origin_length = len(token_utils._current_input_ids)
+        attention_mask = attn_utils.update_attention_local(
+            origin_length=origin_length,
+            new_length=len(merged_input_ids),
+            indicator=None,
+        )
+        input_ids, position_ids = token_utils.set_input_ids(merged_input_ids, return_tensors=True)
+        if use_EPL:
+            position_ids = position_ids - use_compression_all_count
+
+        kv_utils.append_roles(["wait_tmp"] * len(wait_chunk) + ["memory"] * len(comp_tokens))
+        if use_structured_memory:
+            kv_utils.append_scores_for_new_tokens(
+                token_ids=merged_input_ids,
+                novelty_weight=novelty_weight,
+            )
+
+        model_output = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            past_key_values=kv_utils.get_cache(),
+            use_cache=True,
+            return_dict=True,
+            position_ids=position_ids,
+            output_attentions=use_structured_memory,
+        )
+        if use_structured_memory:
+            kv_utils.update_scores_from_attentions(
+                attentions=model_output.attentions,
+                attention_weight=attention_weight,
+                impact_weight=impact_weight,
+                decay=decay,
+            )
+
+        # 删除临时 wait token，仅保留 memory token
+        trim_start = origin_length
+        trim_end = origin_length + len(wait_chunk)
+        kv_utils.reduce_cache(start=trim_start, end=trim_end)
+        token_utils.reduce_input_ids(start=trim_start, end=trim_end)
+
+        local_start = len(token_utils._current_input_ids)
+
+    return local_start
+
 @torch.no_grad()
 def _sentence_level_generate(
     model: Union[LlamaForCausalLM, Qwen2ForCausalLM],
@@ -1336,6 +1732,26 @@ def _sentence_level_generate(
 
     global_start:int = len(token_utils._whole_input_ids) # 整个输入完整的序列，包括cot+压缩token？
     local_start:int = len(token_utils._current_input_ids) # 应该是当前输入的序列，意味着去掉了cot，但是有压缩token
+
+    structured_memory_cfg:Dict = getattr(comp_config, "structured_memory_cfg", {})
+    use_structured_memory = bool(structured_memory_cfg.get("enable", False)) and update_attention_method == "local"
+    if use_structured_memory and int(structured_memory_cfg.get("max_kv_budget", -1)) <= 0:
+        use_structured_memory = False
+
+    attention_weight = float(structured_memory_cfg.get("attention_weight", 1.0))
+    impact_weight = float(structured_memory_cfg.get("impact_weight", 0.0))
+    novelty_weight = float(structured_memory_cfg.get("novelty_weight", 0.0))
+    decay = float(structured_memory_cfg.get("decay", 1.0))
+
+    if use_structured_memory:
+        kv_utils.init_scores_from_tokens(
+            token_ids=token_utils._current_input_ids,
+            novelty_weight=novelty_weight,
+        )
+        kv_utils.init_roles_from_tokens(
+            token_ids=token_utils._current_input_ids,
+            default_role="history",
+        )
 
     use_compression_all_count = 0
     debug_count = 0
@@ -1447,6 +1863,12 @@ def _sentence_level_generate(
             position_ids = token_utils.use_epl_for_compression(position_ids, indicator)
             use_compression_all_count += len(comp_config.get_output_comp_token_id(cot_length=(cot_end - cot_start)))
             cot_start = cot_end + 1
+        if use_structured_memory:
+            kv_utils.append_roles(_roles_for_new_tokens(new_input_ids, comp_config))
+            kv_utils.append_scores_for_new_tokens(
+                token_ids=new_input_ids,
+                novelty_weight=novelty_weight,
+            )
         if DEBUG:
             if update_attention_method == 'global':
                 DebugUtils.show_global_attention(
@@ -1483,17 +1905,69 @@ def _sentence_level_generate(
             use_cache=True,
             return_dict=True,
             position_ids=position_ids,
+            output_attentions=use_structured_memory,
         )
+        if use_structured_memory:
+            kv_utils.update_scores_from_attentions(
+                attentions=model_output.attentions,
+                attention_weight=attention_weight,
+                impact_weight=impact_weight,
+                decay=decay,
+            )
         # 4. update kv cache
         if IS_COMP_MODE:
-            start = local_start
-            end = _local_mask_end
+            if not use_structured_memory:
+                # legacy LightThinker path: remove the abandoned span directly.
+                start = local_start
+                end = _local_mask_end
+                kv_utils.reduce_cache(start=start, end=end)
+                token_utils.reduce_input_ids(start=start, end=end)
 
-            kv_utils.reduce_cache(start=start, end=end)
-            token_utils.reduce_input_ids(start=start, end=end)
-
+            # Always refresh boundaries for the next split span.
             global_start:int = len(token_utils._whole_input_ids)
             local_start:int = len(token_utils._current_input_ids)
+
+            if use_structured_memory:
+                # queue-driven path: rely on role-based budgeting + wait->memory flush,
+                # instead of fixed local-span truncation.
+                local_start = _enforce_structured_memory_budget(
+                    kv_utils=kv_utils,
+                    token_utils=token_utils,
+                    comp_config=comp_config,
+                    memory_cfg=structured_memory_cfg,
+                    local_start=local_start,
+                )
+                local_start = _flush_wait_buffer_to_memory(
+                    model=model,
+                    comp_config=comp_config,
+                    memory_cfg=structured_memory_cfg,
+                    attn_utils=attn_utils,
+                    kv_utils=kv_utils,
+                    token_utils=token_utils,
+                    use_EPL=use_EPL,
+                    use_compression_all_count=use_compression_all_count,
+                    use_structured_memory=use_structured_memory,
+                    attention_weight=attention_weight,
+                    impact_weight=impact_weight,
+                    novelty_weight=novelty_weight,
+                    decay=decay,
+                    local_start=local_start,
+                )
+                local_start = _enforce_structured_memory_budget(
+                    kv_utils=kv_utils,
+                    token_utils=token_utils,
+                    comp_config=comp_config,
+                    memory_cfg=structured_memory_cfg,
+                    local_start=local_start,
+                )
+        elif use_structured_memory:
+            local_start = _enforce_structured_memory_budget(
+                kv_utils=kv_utils,
+                token_utils=token_utils,
+                comp_config=comp_config,
+                memory_cfg=structured_memory_cfg,
+                local_start=local_start,
+            )
 
         # 5. get new predicted_tokens 151665
         predicted_token_id:int = InferenceUtils.get_predicted_token_ids(
@@ -1921,7 +2395,10 @@ def generate(
             repetition_penalty=repetition_penalty
         )
     elif comp_config.output_comp_level == 'sentence':
-        if comp_config.mtp_cfg and spec_decode:
+        use_mtp_register = bool(comp_config.mtp_cfg) and spec_decode
+        if bool(getattr(comp_config, "structured_memory_cfg", {}).get("enable", False)):
+            use_mtp_register = False
+        if use_mtp_register:
             # mtp register generation
             prompt, output = _sentence_level_mtp_register_generate(
                 model=model,
@@ -2037,7 +2514,10 @@ def get_model_and_tokenizer(
 
     if args.model_type.lower() == 'qwen':
         model = Qwen2ForCausalLM.from_pretrained(
-            model_path, torch_dtype=torch.bfloat16, device_map="auto"
+            model_path,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+            attn_implementation="eager",
         )
     elif args.model_type.lower() == 'llama':
         model = LlamaForCausalLM.from_pretrained(
