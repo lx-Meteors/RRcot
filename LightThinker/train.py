@@ -84,43 +84,101 @@ class H2ODynamicCache(DynamicCache):
         self.accumulated_attention_scores: List[torch.Tensor] = []
 
     @torch.no_grad()
-    def update_slimming(self, attention_scores: torch.Tensor, num_kv_groups: int, layer_idx: int):
-        if len(self.accumulated_attention_scores) <= layer_idx:
-            self.accumulated_attention_scores.append(attention_scores.sum(2)[:, ::num_kv_groups, :])
-        else:
-            num_new_tokens = attention_scores.shape[2]
-            updated_attention_scores = attention_scores.sum(2)[:, ::num_kv_groups, :]
-            updated_attention_scores[:, :, :-num_new_tokens] += self.accumulated_attention_scores[layer_idx]
-            self.accumulated_attention_scores[layer_idx] = updated_attention_scores
+    def build_training_sparse_mask(
+        self,
+        bsz: int,
+        num_heads: int,
+        q_len: int,
+        k_len: int,
+        num_kv_groups: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        # Keep all tokens when current context is shorter than target window.
+        if k_len <= self.window_length:
+            return None
 
-        if self.get_seq_length(layer_idx) <= self.window_length:
+        window_len = min(self.window_length, k_len)
+        hh_cnt = min(self.num_hh_tokens, window_len)
+        recent_cnt = window_len - hh_cnt
+        candidate_len = max(k_len - recent_cnt, 0)
+        hh_cnt = min(hh_cnt, candidate_len)
+        recent_cnt = window_len - hh_cnt
+
+        kv_heads = max(num_heads // max(num_kv_groups, 1), 1)
+        keep_global = torch.zeros((bsz, kv_heads, k_len), dtype=torch.bool, device=device)
+        if hh_cnt > 0 and candidate_len > 0:
+            rand_idx = torch.rand(bsz, kv_heads, candidate_len, device=device).argsort(dim=-1)
+            keep_hh_idx = rand_idx[:, :, :hh_cnt].sort(dim=-1).values
+            keep_global[:, :, :candidate_len] = keep_global[:, :, :candidate_len].scatter(-1, keep_hh_idx, True)
+
+        keep_global = keep_global.repeat_interleave(num_kv_groups, dim=1)[:, :num_heads, :]
+
+        q_pos = torch.arange(q_len, device=device).view(1, 1, q_len, 1)
+        k_pos = torch.arange(k_len, device=device).view(1, 1, 1, k_len)
+        causal = k_pos <= q_pos
+
+        if recent_cnt > 0:
+            recent = (k_pos >= (q_pos - recent_cnt + 1)) & causal
+        else:
+            recent = torch.zeros((1, 1, q_len, k_len), dtype=torch.bool, device=device)
+
+        global_mask = keep_global.unsqueeze(2).expand(-1, -1, q_len, -1)
+        allow = (recent | global_mask) & causal
+
+        sparse_mask = torch.zeros((bsz, num_heads, q_len, k_len), dtype=dtype, device=device)
+        sparse_mask = sparse_mask.masked_fill(~allow, torch.finfo(dtype).min)
+        return sparse_mask
+
+    @torch.no_grad()
+    def update_slimming(self, attention_scores: Optional[torch.Tensor], num_kv_groups: int, layer_idx: int):
+        seq_len = self.get_seq_length(layer_idx)
+        if seq_len <= self.window_length:
             return
 
-        seq_len = self.get_seq_length(layer_idx)
-        seq_scores = self.accumulated_attention_scores[layer_idx][:, :, :-self.window_length + self.num_hh_tokens]
-        _, keep_hh_idx = torch.topk(seq_scores, self.num_hh_tokens, dim=-1)
-        keep_hh_idx = keep_hh_idx.sort(dim=-1).values
+        bsz, num_heads, _, head_dim = self.key_cache[layer_idx].shape
+        window_len = min(self.window_length, seq_len)
+        hh_cnt = min(self.num_hh_tokens, window_len)
+        recent_cnt = window_len - hh_cnt
+        candidate_len = seq_len - recent_cnt
+        hh_cnt = min(hh_cnt, candidate_len)
+        recent_cnt = window_len - hh_cnt
 
         keep_local_idx = torch.arange(
-            seq_len - (self.window_length - self.num_hh_tokens),
+            seq_len - recent_cnt,
             seq_len,
-            device=keep_hh_idx.device,
-        ).repeat(keep_hh_idx.shape[0], keep_hh_idx.shape[1], 1)
+            device=self.key_cache[layer_idx].device,
+        ).view(1, 1, -1).expand(bsz, num_heads, -1)
 
-        keep_idx = torch.cat([keep_hh_idx, keep_local_idx], dim=-1)
-        mask = torch.zeros(
-            self.accumulated_attention_scores[layer_idx].shape,
-            dtype=torch.bool,
-            device=keep_hh_idx.device,
-        )
-        mask = mask.scatter(-1, keep_idx, 1)
+        keep_hh_idx = None
+        if attention_scores is not None:
+            if len(self.accumulated_attention_scores) <= layer_idx:
+                self.accumulated_attention_scores.append(attention_scores.sum(2)[:, ::num_kv_groups, :])
+            else:
+                num_new_tokens = attention_scores.shape[2]
+                updated_attention_scores = attention_scores.sum(2)[:, ::num_kv_groups, :]
+                updated_attention_scores[:, :, :-num_new_tokens] += self.accumulated_attention_scores[layer_idx]
+                self.accumulated_attention_scores[layer_idx] = updated_attention_scores
 
-        bsz, num_heads, _, head_dim = self.key_cache[layer_idx].shape
+            if hh_cnt > 0:
+                seq_scores = self.accumulated_attention_scores[layer_idx][:, :, :candidate_len]
+                _, keep_hh_idx = torch.topk(seq_scores, hh_cnt, dim=-1)
+                keep_hh_idx = keep_hh_idx.sort(dim=-1).values
+        elif hh_cnt > 0:
+            rand_idx = torch.rand(bsz, num_heads, candidate_len, device=self.key_cache[layer_idx].device).argsort(dim=-1)
+            keep_hh_idx = rand_idx[:, :, :hh_cnt].sort(dim=-1).values
+
+        keep_idx = keep_local_idx if keep_hh_idx is None else torch.cat([keep_hh_idx, keep_local_idx], dim=-1)
+
+        mask = torch.zeros((bsz, num_heads, seq_len), dtype=torch.bool, device=keep_idx.device)
+        mask = mask.scatter(-1, keep_idx, True)
+
         self.key_cache[layer_idx] = self.key_cache[layer_idx][mask].view(bsz, num_heads, -1, head_dim)
         self.value_cache[layer_idx] = self.value_cache[layer_idx][mask].view(bsz, num_heads, -1, head_dim)
-        self.accumulated_attention_scores[layer_idx] = self.accumulated_attention_scores[layer_idx][mask].view(
-            bsz, num_heads, -1
-        )
+        if len(self.accumulated_attention_scores) > layer_idx:
+            self.accumulated_attention_scores[layer_idx] = self.accumulated_attention_scores[layer_idx][mask].view(
+                bsz, num_heads, -1
+            )
 
 
 class H2OTrainer(Trainer):
@@ -377,13 +435,13 @@ def get_model_and_tokenizer(
             mtp_params["forzen_model_train_mtp"] = True
 
         model_config.update(mtp_params)
-        qwen_extra_kwargs = dict(attn_implementation="eager") if args.model_type == 'qwen' else {}
+        model_extra_kwargs = dict(attn_implementation="eager") if args.use_h2o else {}
         model = model_class.from_pretrained(
             args.model_path,
             config=model_config,
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
-            **qwen_extra_kwargs,
+            **model_extra_kwargs,
         )
         if getattr(model_config, "init", False):
             _print(f"initialize mtp from last layer...")
@@ -393,11 +451,11 @@ def get_model_and_tokenizer(
     
     else:
         _print(f"use ce loss...")
-        qwen_extra_kwargs = dict(attn_implementation="eager") if args.model_type == 'qwen' else {}
+        model_extra_kwargs = dict(attn_implementation="eager") if args.use_h2o else {}
         model = model_class.from_pretrained(
             args.model_path,
             torch_dtype=torch.bfloat16,
-            **qwen_extra_kwargs,
+            **model_extra_kwargs,
         )
     
     # 1. 挂载钩子 (核心步骤)

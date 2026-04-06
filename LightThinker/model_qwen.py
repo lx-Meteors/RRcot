@@ -357,9 +357,24 @@ class Qwen2Attention(nn.Module):
             causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
             attn_weights = attn_weights + causal_mask
 
+        if past_key_value is not None and hasattr(past_key_value, "build_training_sparse_mask"):
+            sparse_mask = past_key_value.build_training_sparse_mask(
+                bsz=bsz,
+                num_heads=self.num_heads,
+                q_len=q_len,
+                k_len=key_states.shape[-2],
+                num_kv_groups=self.num_key_value_groups,
+                device=attn_weights.device,
+                dtype=attn_weights.dtype,
+            )
+            if sparse_mask is not None:
+                attn_weights = attn_weights + sparse_mask
+
         # upcast attention to fp32
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
         attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
+        if past_key_value is not None and hasattr(past_key_value, "update_slimming"):
+            past_key_value.update_slimming(attn_weights.detach(), self.num_key_value_groups, self.layer_idx)
         attn_output = torch.matmul(attn_weights, value_states)
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
@@ -490,6 +505,9 @@ class Qwen2FlashAttention2(Qwen2Attention):
             use_top_left_mask=self._flash_attn_uses_top_left_mask,
         )
 
+        if past_key_value is not None and hasattr(past_key_value, "update_slimming"):
+            past_key_value.update_slimming(None, self.num_key_value_groups, self.layer_idx)
+
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size).contiguous()
         attn_output = self.o_proj(attn_output)
 
@@ -567,6 +585,19 @@ class Qwen2SdpaAttention(Qwen2Attention):
         if attention_mask is not None:  # no matter the length, we just slice it
             causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
 
+        if past_key_value is not None and hasattr(past_key_value, "build_training_sparse_mask"):
+            sparse_mask = past_key_value.build_training_sparse_mask(
+                bsz=bsz,
+                num_heads=self.num_heads,
+                q_len=q_len,
+                k_len=key_states.shape[-2],
+                num_kv_groups=self.num_key_value_groups,
+                device=query_states.device,
+                dtype=query_states.dtype,
+            )
+            if sparse_mask is not None:
+                causal_mask = sparse_mask if causal_mask is None else (causal_mask + sparse_mask)
+
         # SDPA with memory-efficient backend is currently (torch==2.1.2) bugged with non-contiguous inputs with custom attn_mask,
         # Reference: https://github.com/pytorch/pytorch/issues/112577.
         if query_states.device.type == "cuda" and attention_mask is not None:
@@ -587,6 +618,9 @@ class Qwen2SdpaAttention(Qwen2Attention):
             dropout_p=self.attention_dropout if self.training else 0.0,
             is_causal=is_causal,
         )
+
+        if past_key_value is not None and hasattr(past_key_value, "update_slimming"):
+            past_key_value.update_slimming(None, self.num_key_value_groups, self.layer_idx)
 
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.view(bsz, q_len, self.hidden_size)
