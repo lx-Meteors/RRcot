@@ -412,8 +412,8 @@ TRAIN_GPUS="0,1,2,3,4,5,6,7"
 MAX_LENGTH=4096
 EPOCHS=5
 SAVE_STEPS=2
-MICRO_BATCH_SIZE=2
-GRADIENT_ACCUMULATION_STEPS=4
+MICRO_BATCH_SIZE=1
+GRADIENT_ACCUMULATION_STEPS=1
 WARMUP_RATIO=0.05
 WARMUP_STEPS=0
 LR_SCHEDULER_TYPE="cosine"
@@ -578,12 +578,12 @@ log "执行完成: ${STAGE}"
 
 # # 运行示例 all
 # bash /mnt/zhaorunsong/lx/mem-co-t/scripts/pipeline.sh \
-#   --stage train \
-#   --exp_tag epl_mtp_1 \
+#   --stage infer \
+#   --exp_tag epl_mtp_re \
 #   --output_base_dir /mnt/zhaorunsong/lx/rrcot_test/experiments \
 #   --use_epl true \
 #   --lr 2e-5 \
-#   --mode aug-wo-pc-apa-mtp \
+#   --mode aug-wo-pc \
 #   --model_type qwen \
 #   --tokenizer_path /mnt/zhaorunsong/models/qwen2-0.5B-Instruct \
 #   --train_model_path /mnt/zhaorunsong/models/qwen2-0.5B-Instruct \
@@ -591,10 +591,9 @@ log "执行完成: ${STAGE}"
 #   --train_gpus 0,5,6,7 \
 #   --target_gpus 0,5,6,7 \
 #   --process_per_gpu 1 \
-#   --comp_config "adaptive_mtp_v1" \
-#   --conf_version "adaptive_mtp_v1" \
+#   --comp_config "adaptive_v1" \
+#   --conf_version "adaptive_v1" \
 #   --max_length 2048 \
-#   --spec_decode True \
 #   --datasets mmlu,gsm8k,gpqa,bbh
 
 

@@ -1331,76 +1331,120 @@ def _sentence_level_generate(
 
     new_token_counters = 0
     eos_token_id = tokenizer.eos_token_id
-    # eos_token_id = None
-    output_comp_step = comp_config.output_comp_step
+    global_start:int = len(token_utils._whole_input_ids)
+    local_start:int = len(token_utils._current_input_ids)
 
-    global_start:int = len(token_utils._whole_input_ids) # 整个输入完整的序列，包括cot+压缩token？
-    local_start:int = len(token_utils._current_input_ids) # 应该是当前输入的序列，意味着去掉了cot，但是有压缩token
+    hot_window_steps = int(comp_config.output_cfg.get("hot_window_steps", 1))
+    cold_window_steps = int(comp_config.output_cfg.get("cold_window_steps", 5))
+    compressed_window_steps = int(comp_config.output_cfg.get("compressed_window_steps", 5))
 
     use_compression_all_count = 0
     debug_count = 0
-    cot_start = global_start
-    cot_end = 0
-    van_cot_start = global_start
+
+    # 每个 thought 的 local 区间 [start, end)，end 包含 splitter 的位置+1
+    thought_start_local = local_start
+    hot_ranges: List[Tuple[int, int]] = []
+    cold_ranges: List[Tuple[int, int]] = []
+    compressed_ranges: List[Tuple[int, int]] = []
+
+    def _shift_ranges(ranges: List[Tuple[int, int]], start: int, end: int) -> List[Tuple[int, int]]:
+        shift = end - start
+        new_ranges: List[Tuple[int, int]] = []
+        for s, e in ranges:
+            if e <= start:
+                new_ranges.append((s, e))
+            elif s >= end:
+                new_ranges.append((s - shift, e - shift))
+            else:
+                # 与删除区间重叠的range直接丢弃（当前逻辑下不会保留部分）
+                continue
+        return new_ranges
+
+    def _shift_point(point: int, start: int, end: int) -> int:
+        if point >= end:
+            return point - (end - start)
+        if start <= point < end:
+            return start
+        return point
+
     assert local_start == kv_utils.get_cache()._seen_tokens, \
         f"{local_start} == {kv_utils.get_cache()._seen_tokens}"
     while predicted_token_id != eos_token_id and new_token_counters < max_new_tokens:
         new_input_ids = [predicted_token_id]
         IS_COMP_MODE:bool = False
+        comp_remove_start = None
+        comp_remove_end = None
+        comp_token_len = 0
+        current_step_end = None
         token_utils.show_output_input_ids.append(predicted_token_id)
-        # print(tokenizer.decode(token_utils.show_output_input_ids))
+
         # 1. construct attention_mask
         if predicted_token_id == comp_config.split_token_id:
-            IS_COMP_MODE = True
+            # 当前 thought 到 splitter 结束
+            current_step_end = len(token_utils._current_input_ids) + 1
+            hot_ranges.append((thought_start_local, current_step_end))
 
-            # print(tokenizer.decode(token_utils._current_input_ids))
+            # 热窗口溢出时，最老 thought 进入冷窗口
+            while len(hot_ranges) > hot_window_steps:
+                cold_ranges.append(hot_ranges.pop(0))
 
-            last_pos_raw = int(token_utils.get_position_ids()[0, -1].item())
-            if use_EPL:
-                last_pos_epl = last_pos_raw - use_compression_all_count
-                cot_length = last_pos_epl + 2 - cot_start
+            # 冷窗口达到阈值时触发压缩
+            if len(cold_ranges) >= cold_window_steps:
+                IS_COMP_MODE = True
+                comp_remove_start = cold_ranges[0][0]
+                comp_remove_end = cold_ranges[-1][1]
+
+                cot_length = comp_remove_end - comp_remove_start
+                comp_tokens = comp_config.get_output_comp_token_id(cot_length=cot_length)
+                new_input_ids.extend(comp_tokens)
+                new_input_ids.append(comp_config.continue_token_id)
+                comp_token_len = len(comp_tokens) + 1
+
+                new_length = len(new_input_ids)
+                if update_attention_method == 'global':
+                    origin_length = len(token_utils._whole_input_ids)
+                    indicator = [
+                        comp_remove_start,
+                        comp_remove_end,
+                        0,
+                        origin_length + 1,
+                        origin_length + 1 + len(comp_tokens),
+                        1,
+                    ]
+                    attention_mask = attn_utils.update_attention_global(
+                        new_length=new_length,
+                        indicator=indicator,
+                    )
+                else:
+                    origin_length = len(token_utils._current_input_ids)
+                    indicator = [
+                        comp_remove_start,
+                        comp_remove_end,
+                        0,
+                        origin_length + 1,
+                        origin_length + 1 + len(comp_tokens),
+                        1,
+                    ]
+                    attention_mask = attn_utils.update_attention_local(
+                        origin_length=origin_length,
+                        new_length=new_length,
+                        indicator=indicator
+                    )
             else:
-                cot_length = last_pos_raw + 2 - van_cot_start
-            
-            new_input_ids.extend(
-                comp_config.get_output_comp_token_id(cot_length=cot_length)
-            )
-            new_input_ids.append(
-                comp_config.continue_token_id
-            )
-            new_length = len(new_input_ids)
-            if update_attention_method == 'global':
-                origin_length = len(token_utils._whole_input_ids)
-                indicator = [
-                    global_start,
-                    origin_length + 1,  # the last token has not been included yet.
-                    0,
-                    origin_length + 1,
-                    origin_length + 1 + len(comp_config.get_output_comp_token_id(cot_length=cot_length)),
-                    1,
-                ]
-                attention_mask = attn_utils.update_attention_global(
-                    new_length=new_length,
-                    indicator=indicator,
-                )
-            else:
-                origin_length = len(token_utils._current_input_ids)
-                indicator = [
-                    local_start,
-                    origin_length + 1,
-                    0,
-                    origin_length + 1,
-                    origin_length + 1 + len(comp_config.get_output_comp_token_id(cot_length=cot_length)),
-                    1,
-                ]
-                attention_mask = attn_utils.update_attention_local(
-                    origin_length=origin_length,
-                    new_length=new_length,
-                    indicator=indicator
-                )
+                if update_attention_method == 'global':
+                    attention_mask = attn_utils.update_attention_global(
+                        new_length=1,
+                        indicator=None
+                    )
+                else:
+                    origin_length = len(token_utils._current_input_ids)
+                    attention_mask = attn_utils.update_attention_local(
+                        origin_length=origin_length,
+                        new_length=1,
+                        indicator=None
+                    )
         else:
             if update_attention_method == 'global':
-                origin_length = len(token_utils._whole_input_ids)
                 attention_mask = attn_utils.update_attention_global(
                     new_length=1,
                     indicator=None
@@ -1421,32 +1465,29 @@ def _sentence_level_generate(
             # exceed length
             break
 
-        # ......The code is beautifully repeated......
         input_ids, position_ids = token_utils.set_input_ids(new_input_ids, return_tensors=True)
-        if IS_COMP_MODE:
-            van_cot_start = int(position_ids[0][-1].item()) + 1
         if use_EPL:
             position_ids = position_ids - use_compression_all_count
 
         if use_EPL and IS_COMP_MODE:
-            # 这里 position_ids 是 '<|splitter|><|o_0|><|o_1|><|o_2|><|o_3|><|o_4|><|o_5|><|o_6|><|o_7|><|o_8|><|continue|>' 对应的正常位置编码
-            # position_ids[0][0] 是 <|splitter|> position id
-            # cot_start 是 cot first token position id，cot_end 是 <|o_0|> position id
-            # cot_end - cot_start 是算上<|splitter|>的 cot 长度，也就是 n_abandoned
-            # 训练时 <|splitter|> 也是算在 n_abandoned 之内的
-            cot_end = int(position_ids[0][0].item()) + 1
-            step = (cot_end - cot_start) / len(comp_config.get_output_comp_token_id(cot_length=(cot_end - cot_start)))
+            # 仅在压缩触发时对本次 cold 区间使用 EPL
+            assert comp_remove_start is not None and comp_remove_end is not None
+            n_abandoned = comp_remove_end - comp_remove_start
+            n_compressed = len(new_input_ids) - 2  # splitter + comp_tokens + continue
+            cot_start_pos = token_utils._current_position_ids[comp_remove_start] - use_compression_all_count
+            cot_end_pos = token_utils._current_position_ids[comp_remove_end - 1] - use_compression_all_count + 1
+            if n_compressed > 0:
+                step = (cot_end_pos - cot_start_pos) / n_compressed
+            else:
+                step = 1
             indicator = [
-                    cot_start, # cot first token position id
-                    cot_end, # <|o_1|> position id
-                    step, # 压缩步长
-                    len(comp_config.get_output_comp_token_id(cot_length=(cot_end - cot_start))) # 压缩token数量
-                ]
-            # 更新cot位置
-            # 这里算上 <|continue|>，对应下一段 cot 的 first token position id
+                cot_start_pos,
+                cot_end_pos,
+                step,
+                n_compressed,
+            ]
             position_ids = token_utils.use_epl_for_compression(position_ids, indicator)
-            use_compression_all_count += len(comp_config.get_output_comp_token_id(cot_length=(cot_end - cot_start)))
-            cot_start = cot_end + 1
+            use_compression_all_count += n_compressed
         if DEBUG:
             if update_attention_method == 'global':
                 DebugUtils.show_global_attention(
@@ -1474,8 +1515,6 @@ def _sentence_level_generate(
                     file_name="debug_local_1.png",
                 )
 
-        # 3. generate new token(本来对这里有疑问的，为什么attention_mask是全0？因为当前只传入了一个token，前面的是kvcache，所以前面正常应该都能看到？
-        # 突然看到非压缩时indicator都是None，貌似合理了)
         model_output = model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -1486,16 +1525,45 @@ def _sentence_level_generate(
         )
         # 4. update kv cache
         if IS_COMP_MODE:
-            start = local_start
-            end = _local_mask_end
+            assert comp_remove_start is not None and comp_remove_end is not None
 
-            kv_utils.reduce_cache(start=start, end=end)
-            token_utils.reduce_input_ids(start=start, end=end)
+            # 先删除被压缩的 cold 窗口原文
+            kv_utils.reduce_cache(start=comp_remove_start, end=comp_remove_end)
+            token_utils.reduce_input_ids(start=comp_remove_start, end=comp_remove_end)
 
-            global_start:int = len(token_utils._whole_input_ids)
-            local_start:int = len(token_utils._current_input_ids)
+            hot_ranges = _shift_ranges(hot_ranges, comp_remove_start, comp_remove_end)
+            cold_ranges = _shift_ranges(cold_ranges, comp_remove_start, comp_remove_end)
+            compressed_ranges = _shift_ranges(compressed_ranges, comp_remove_start, comp_remove_end)
+            thought_start_local = _shift_point(thought_start_local, comp_remove_start, comp_remove_end)
 
-        # 5. get new predicted_tokens 151665
+            # 冷窗口被整体压缩后清空
+            cold_ranges.clear()
+
+            # 记录本次新增压缩块（comp_tokens + continue）位置
+            # comp块在 append 前位于 old_current_len + 1，删除早期区间后左移。
+            old_current_len = _local_mask_end - 1
+            comp_start = old_current_len + 1 - (comp_remove_end - comp_remove_start)
+            comp_end = comp_start + comp_token_len
+            compressed_ranges.append((comp_start, comp_end))
+
+            # 压缩窗口 FIFO 驱逐：最多保留 compressed_window_steps 个压缩块
+            if compressed_window_steps > 0:
+                while len(compressed_ranges) > compressed_window_steps:
+                    evict_start, evict_end = compressed_ranges.pop(0)
+                    kv_utils.reduce_cache(start=evict_start, end=evict_end)
+                    token_utils.reduce_input_ids(start=evict_start, end=evict_end)
+                    hot_ranges = _shift_ranges(hot_ranges, evict_start, evict_end)
+                    cold_ranges = _shift_ranges(cold_ranges, evict_start, evict_end)
+                    compressed_ranges = _shift_ranges(compressed_ranges, evict_start, evict_end)
+                    thought_start_local = _shift_point(thought_start_local, evict_start, evict_end)
+
+            global_start = len(token_utils._whole_input_ids)
+            local_start = len(token_utils._current_input_ids)
+            thought_start_local = len(token_utils._current_input_ids)
+        elif predicted_token_id == comp_config.split_token_id:
+            # 未压缩时，splitter 后开始下一步 thought
+            thought_start_local = len(token_utils._current_input_ids)
+
         predicted_token_id:int = InferenceUtils.get_predicted_token_ids(
             model_output=model_output, idx=-1,token_utils=token_utils,repetition_penalty=repetition_penalty,tokenizer=tokenizer
         )

@@ -48,7 +48,11 @@ class MyDataset(torch.utils.data.Dataset):
         
         # 预处理
         self.init()
-        self.init_for_aug_data_wo_pc()
+        self.init_for_aug_data_wo_pc(
+            hot_window_steps=int(self.config.output_cfg.get("hot_window_steps", 1)),
+            cold_window_steps=int(self.config.output_cfg.get("cold_window_steps", 5)),
+            compressed_window_steps=int(self.config.output_cfg.get("compressed_window_steps", 5)),
+        )
     
     #token level，感觉没用到
     def insert_comp_for_output(self, output:str) -> Tuple[List[str], List[List[int]]]:
@@ -366,7 +370,20 @@ class MyDataset(torch.utils.data.Dataset):
             pbar.update(1)
     
     # 不压缩prompt
-    def init_for_aug_data_wo_pc(self, system_compression: bool=False):
+    def init_for_aug_data_wo_pc(
+        self, 
+        system_compression: bool=False,
+        hot_window_steps: int=5,
+        cold_window_steps: int=5,
+        compressed_window_steps: int=10,
+    ):
+        """
+        基于step数量的窗口管理
+        args:
+            - hot_window_steps: 热窗口最多包含的step数（thought数）
+            - cold_window_steps: 冷窗口最多包含的step数，达到时压缩
+            - compressed_window_steps: 压缩窗口最多包含的压缩块数，超过则FIFO驱逐
+        """
         pbar = tqdm(total=len(self.meta_data))
         for item in self.meta_data:
             assert isinstance(item, dict)
@@ -411,26 +428,78 @@ class MyDataset(torch.utils.data.Dataset):
             else:
                 assert False, "we don's support now"
 
-            # 2.output
+            # 2. output 部分 - 按句子级粒度组织（为WindowedKVCache推理做准备）
+            output_comp_adaptive_num_token = list()
+            
             if self.config.output_comp_level == 'token':
                 output_indicator_list, output_content_list = self.insert_comp_for_output(
                     gt_output + self.tokenizer.eos_token if add_eos else gt_output
                 )
             else:
-                # sentence level
+                # sentence level with step-based windowed management
+                # 每个 thought 视为 1 step: 热窗口保留最近 step，不压缩；冷窗口累计到阈值后整体压缩。
                 output_indicator_list = list()
                 output_content_list = list()
-                output_comp_adaptive_num_token = list()
-                for thought in thoughts_list:
-                    output_indicator_list.append("abandoned")
-                    output_content_list.append(thought + '\n' + self.config.split_token)
-                    output_indicator_list.append("compressed-output")
-                    if self.config.compression_ratio > 0: # compression_ratio大于0则自适应压缩，等于-1则固定token压缩个数
-                        output_comp_tokens, num_comp_tokens = self.config.get_adaptive_output_comp_token(tokenizer=self.tokenizer, thought=thought)
-                        output_content_list.append(self.output_compress_instruction + output_comp_tokens + self.config.continue_token)
-                        output_comp_adaptive_num_token.append(num_comp_tokens)
+
+                hot_window_thoughts: List[str] = []
+                cold_window_thoughts: List[str] = []
+                hot_window_count = 0
+                cold_window_count = 0
+                compressed_blocks: List[Tuple[str, str, Optional[int]]] = []
+
+                def _compress_cold_window():
+                    nonlocal cold_window_thoughts, cold_window_count, compressed_blocks
+                    if not cold_window_thoughts:
+                        return
+
+                    cold_window_text = ''.join(cold_window_thoughts)
+                    if self.config.compression_ratio > 0:
+                        output_comp_tokens, num_comp_tokens = self.config.get_adaptive_output_comp_token(
+                            tokenizer=self.tokenizer, thought=cold_window_text
+                        )
+                        comp_text = self.output_compress_instruction + output_comp_tokens + self.config.continue_token
+                        compressed_blocks.append((cold_window_text, comp_text, num_comp_tokens))
                     else:
-                        output_content_list.append(self.output_compress_instruction + self.config.get_output_comp_token(return_list=False) + self.config.continue_token)
+                        comp_text = self.output_compress_instruction + self.config.get_output_comp_token(return_list=False) + self.config.continue_token
+                        compressed_blocks.append((cold_window_text, comp_text, None))
+
+                    # 压缩窗口容量上限：保留最近 compressed_window_steps 个压缩块
+                    if compressed_window_steps > 0 and len(compressed_blocks) > compressed_window_steps:
+                        compressed_blocks = compressed_blocks[-compressed_window_steps:]
+
+                    cold_window_thoughts = []
+                    cold_window_count = 0
+
+                for thought in thoughts_list:
+                    thought_with_sep = thought + '\n' + self.config.split_token
+                    if hot_window_count < hot_window_steps:
+                        hot_window_thoughts.append(thought_with_sep)
+                        hot_window_count += 1
+                    else:
+                        cold_window_thoughts.extend(hot_window_thoughts)
+                        cold_window_count += hot_window_count
+                        hot_window_thoughts = [thought_with_sep]
+                        hot_window_count = 1
+
+                        if cold_window_count >= cold_window_steps:
+                            _compress_cold_window()
+
+                if cold_window_thoughts:
+                    _compress_cold_window()
+
+                # 先放压缩窗口内容，再放热窗口内容，确保训练时序与推理目标一致。
+                for abandoned_text, comp_text, adaptive_num in compressed_blocks:
+                    output_indicator_list.append("abandoned")
+                    output_content_list.append(abandoned_text)
+                    output_indicator_list.append("compressed-output")
+                    output_content_list.append(comp_text)
+                    if adaptive_num is not None:
+                        output_comp_adaptive_num_token.append(adaptive_num)
+
+                for thought_text in hot_window_thoughts:
+                    output_indicator_list.append("save")
+                    output_content_list.append(thought_text)
+
                 if add_eos:
                     output_indicator_list.append("save")
                     output_content_list.append(self.tokenizer.eos_token)

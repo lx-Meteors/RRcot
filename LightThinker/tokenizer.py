@@ -127,8 +127,11 @@ class Tokenizer:
         check_consistency:bool=False,
         recover_mode:bool=False,
         use_EPL:bool=False,
-        output_comp_adaptive_num_token:List[int]=[],
+        output_comp_adaptive_num_token:Optional[List[int]]=None,
     ) -> Tuple[List[Dict], Dict]:
+        if output_comp_adaptive_num_token is None:
+            output_comp_adaptive_num_token = []
+
         # 1. tokenize
         whole_input = ""
         tokenized_whole_input_from_segement = list()
@@ -209,7 +212,7 @@ class Tokenizer:
                         assert structured_input_indicator[i][j+1] in ['compressed-prompt', 'compressed-output']
                         n_comp = n_comp_for_prompt if structured_input_indicator[i][j+1] == 'compressed-prompt' else n_comp_for_output
                         n_continue = n_continue_for_prompt if structured_input_indicator[i][j+1] == 'compressed-prompt' else n_continue_for_output
-                        if len(output_comp_adaptive_num_token) > 0:
+                        if structured_input_indicator[i][j+1] == 'compressed-output' and len(output_comp_adaptive_num_token) > 0:
                             n_comp = output_comp_adaptive_num_token[adaptive_index]
                             adaptive_index += 1
                         assert len(tokenized_input_id_list[i][j+1]) - n_comp - n_continue >= 0
@@ -235,17 +238,18 @@ class Tokenizer:
                             base_pos = len(final_item['input_ids']) - compression_count
                             end_pos = len(final_item['input_ids']) + n_abandoned - compression_count
                             compressed_positions = []
-                            step = n_abandoned / n_compressed
-                            for k in range(n_compressed):
-                                # k * step: 当前分段的起始
-                                # step / 2: 当前分段的中心偏移量
-                                # base_pos: 全局起始偏移
-                                # int(...): 向下取整得到整数索引
-                                center_offset = int(k * step + step / 2)
-                                
-                                # 计算最终位置
-                                pos = base_pos + center_offset
-                                compressed_positions.append(pos)
+                            if n_compressed > 0:
+                                step = n_abandoned / n_compressed
+                                for k in range(n_compressed):
+                                    # k * step: 当前分段的起始
+                                    # step / 2: 当前分段的中心偏移量
+                                    # base_pos: 全局起始偏移
+                                    # int(...): 向下取整得到整数索引
+                                    center_offset = int(k * step + step / 2)
+                                    
+                                    # 计算最终位置
+                                    pos = base_pos + center_offset
+                                    compressed_positions.append(pos)
                             
                         else:
                             compressed_positions = None

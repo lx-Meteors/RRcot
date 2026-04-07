@@ -22,6 +22,9 @@
         "token_desp": "compress output {t_id}",
         "meta_compress_step": 1,
         "compression_ratio": 5,
+        "hot_window_steps": 3,
+        "cold_window_steps": 3,
+        "compressed_window_steps": 6,
         "forzen_model_train_mtp": false,
         "share_compression_token": false
     }
